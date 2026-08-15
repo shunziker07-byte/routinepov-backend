@@ -19,7 +19,7 @@ app.post('/api/generate-recipe', async (req, res) => {
     if (!ingredients) return res.status(400).json({ error: "Ingrédients manquants" });
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.5-flash',
       contents: `Propose une recette simple avec ces ingrédients : ${ingredients}`,
       config: {
         responseMimeType: "application/json",
@@ -61,7 +61,7 @@ app.post('/api/analyze-meal-photo', async (req, res) => {
     const [, mimeType, base64Data] = match;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.5-flash',
       contents: [
         { inlineData: { mimeType, data: base64Data } },
         { text:
@@ -131,7 +131,7 @@ app.post('/api/evaluate-life-goal', async (req, res) => {
       `en 2-3 phrases, et propose 1 à 3 recommandations concrètes.`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.5-flash',
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -180,7 +180,7 @@ app.post('/api/assistant-chat', async (req, res) => {
       : '';
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.5-flash',
       contents:
         `Tu es l'assistant intégré de l'application "My RoutinePov" (suivi personnel : ` +
         `objectifs, tâches, finances, recettes, voyages, sport, repas, poids, pas). ` +
