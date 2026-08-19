@@ -99,6 +99,336 @@ try {
 const fsDb = () => admin.firestore();
 
 // ============================================================================
+// Subscription — statut FREE / TRIAL / PREMIUM de l'utilisateur.
+// ----------------------------------------------------------------------------
+// Document stocké dans users/{uid}/subscription/current, dans une collection
+// "subscription" séparée de "data" (users/{uid}/data/{key} — voir dbGet/dbSet
+// côté frontend). Cette séparation est volontaire : contrairement aux clés de
+// "data", ce document ne doit JAMAIS pouvoir être écrit par le frontend (voir
+// Firestore Security Rules) — seul ce backend (plus tard : webhook Stripe ou
+// action admin) pourra le modifier. À ce stade, AUCUNE écriture n'existe
+// encore : uniquement la lecture et la valeur par défaut.
+//
+// Tous les utilisateurs (existants ou nouveaux) sans document sont considérés
+// FREE/none par défaut, sans qu'il soit nécessaire de créer ce document pour
+// chacun d'eux.
+// ============================================================================
+const DEFAULT_SUBSCRIPTION = {
+  plan: 'free',
+  status: 'none',
+  // "source" et "expiresAt" ajoutés à cette étape (gestion des accès Premium
+  // offerts par un admin) — fusionnés avec les champs déjà posés à l'étape 2
+  // (trialStart..stripeSubscriptionId), pas de remplacement de la structure.
+  source: 'none',
+  trialStart: null,
+  trialEnd: null,
+  currentPeriodStart: null,
+  currentPeriodEnd: null,
+  billingInterval: null,
+  expiresAt: null,
+  stripeCustomerId: null,
+  stripeSubscriptionId: null,
+  updatedAt: null
+};
+
+// Point d'entrée UNIQUE pour lire le statut d'abonnement d'un utilisateur —
+// à réutiliser partout où ce statut est nécessaire côté serveur, pour éviter
+// que plusieurs bouts de code n'interprètent différemment un document
+// manquant ou partiel. Renvoie toujours une structure complète.
+async function getSubscription(uid) {
+  try {
+    const snap = await fsDb().collection('users').doc(uid).collection('subscription').doc('current').get();
+    if (!snap.exists) {
+      console.log('[SUBSCRIPTION] no subscription document → default FREE');
+      return { ...DEFAULT_SUBSCRIPTION };
+    }
+    // Fusionné avec les valeurs par défaut : un document existant mais
+    // partiel (créé manuellement, ou futur champ ajouté plus tard) reste
+    // toujours complet côté appelant.
+    return { ...DEFAULT_SUBSCRIPTION, ...snap.data() };
+  } catch (e) {
+    console.error('[SUBSCRIPTION] Firestore read failed', e);
+    return { ...DEFAULT_SUBSCRIPTION };
+  }
+}
+
+// Convertit une valeur trialEnd potentiellement hétérogène (Firestore Timestamp,
+// ISO string, ou millis) en objet Date. Rien n'écrit encore ce champ (il reste
+// toujours null pour l'instant), mais getEffectivePlan doit rester robuste peu
+// importe la représentation choisie plus tard (Stripe, admin, etc.).
+function toDateSafe(value) {
+  if (!value) return null;
+  if (typeof value.toDate === 'function') return value.toDate(); // Firestore Timestamp
+  if (typeof value === 'number') return new Date(value);
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// ============================================================================
+// hasPremiumAccess — fonction centrale unique décidant si un utilisateur a
+// accès aux fonctionnalités Premium, MAINTENANT. Ne modifie JAMAIS le
+// document Firestore (pas de downgrade automatique écrit ici) : un Premium
+// expiré (trial ou cadeau) est simplement traité comme sans accès pour cette
+// requête — le document reste tel quel, contrôlé en temps réel à chaque
+// appel, sans avoir besoin d'un cron pour "corriger" la valeur stockée.
+//
+//   - plan "admin"           → accès Premium toujours accordé (jamais soumis
+//                               à expiresAt : un rôle admin ne "périme" pas).
+//   - plan "premium", actif  → accès accordé si pas d'expiration dépassée.
+//     L'expiration pertinente dépend du statut : trialEnd pendant un essai,
+//     sinon expiresAt (cadeau admin, ou futur renouvellement payant).
+//   - tout le reste (dont "free")            → pas d'accès.
+// ============================================================================
+function hasPremiumAccess(subscription) {
+  const sub = subscription || DEFAULT_SUBSCRIPTION;
+  if (sub.plan === 'admin') return true;
+  if (sub.plan !== 'premium') return false;
+  if (sub.status !== 'active' && sub.status !== 'trialing') return false;
+
+  const expiry = sub.status === 'trialing' ? sub.trialEnd : sub.expiresAt;
+  if (expiry) {
+    const expiryDate = toDateSafe(expiry);
+    if (expiryDate && expiryDate.getTime() < Date.now()) return false; // expiré
+  }
+  return true; // pas d'expiration = permanent
+}
+
+// Rôle admin — distinct de l'accès Premium (un admin A un accès Premium via
+// hasPremiumAccess, mais isAdmin sert à protéger les routes /api/admin/*
+// elles-mêmes, où "a accès aux fonctionnalités Premium" ne suffit pas).
+function isAdmin(subscription) {
+  const sub = subscription || DEFAULT_SUBSCRIPTION;
+  return sub.plan === 'admin';
+}
+
+// Plan effectif "free"/"premium" utilisé par le système de limites de
+// l'étape 3 (FEATURE_LIMITS n'a que ces deux clés) — admin s'y range du côté
+// premium via hasPremiumAccess, sans dupliquer la logique d'expiration.
+function getEffectivePlan(subscription) {
+  return hasPremiumAccess(subscription) ? 'premium' : 'free';
+}
+
+// ============================================================================
+// Table centrale des limites par plan.
+// ----------------------------------------------------------------------------
+// - Un nombre = limite de QUANTITÉ (compte des éléments existants).
+// - { count, window } = limite TEMPORELLE (compteur d'utilisation par
+//   semaine/mois, voir users/{uid}/usage/{feature-periodKey} plus bas).
+// - Infinity = illimité. Volontairement gardé en Infinity (pas en null) dans
+//   cette constante JS : Infinity se sérialise nativement en `null` via
+//   JSON.stringify/res.json, donc le frontend reçoit bien `null = unlimited`
+//   sans conversion manuelle à faire à chaque endroit — un seul sentinel dans
+//   tout le fichier.
+// ============================================================================
+const FEATURE_LIMITS = {
+  free: {
+    trips: 1,
+    lifePlannerActive: 5,
+    gymSessions: 7,
+    transactions: 10,
+    recipes: 20,
+    customFoods: 20,
+    lifeGoals: 3,
+    todoLists: 2,
+    tasks: 50,
+    assistantChat: { count: 3, window: 'week' },
+    assistantVoice: { count: 3, window: 'week' },
+    mealPhotoAnalysis: { count: 3, window: 'month' },
+    statsHistoryDays: 7,
+    generalHistoryDays: 30
+  },
+  premium: {
+    trips: Infinity,
+    lifePlannerActive: Infinity,
+    gymSessions: Infinity,
+    transactions: Infinity,
+    recipes: Infinity,
+    customFoods: Infinity,
+    lifeGoals: Infinity,
+    todoLists: Infinity,
+    tasks: Infinity,
+    assistantChat: { count: Infinity, window: 'week' },
+    assistantVoice: { count: Infinity, window: 'week' },
+    mealPhotoAnalysis: { count: Infinity, window: 'month' },
+    statsHistoryDays: Infinity,
+    generalHistoryDays: Infinity
+  }
+};
+
+// "Features" purement informatives (nombre de jours d'historique affiché) :
+// il n'y a rien à "autoriser/refuser" ici, donc canUseFeature() les traite à
+// part plutôt que d'inventer une notion de "used" qui n'aurait pas de sens.
+const DISPLAY_ONLY_FEATURES = new Set(['statsHistoryDays', 'generalHistoryDays']);
+
+// ============================================================================
+// Sources de comptage pour les limites de QUANTITÉ — une entrée par feature,
+// pointant vers la même clé Firestore (users/{uid}/data/{key}) que celle déjà
+// utilisée par dbGet/dbSet côté frontend (voir js/01-core-home-goals-todos.js
+// et consorts). Vérifié dans le code actuel de chaque onglet avant d'écrire
+// ceci — aucune structure supposée :
+//   - trips            -> mrp-voyages-advanced : { trips: [...] }
+//   - gymSessions       -> mrp-gym-history      : [...] (tableau direct)
+//   - transactions      -> mrp-budget           : [...] (tableau direct)
+//   - recipes           -> mrp-recipes          : [...] (tableau direct)
+//   - lifeGoals         -> mrp-goals            : [...] (tableau direct)
+//   - todoLists         -> mrp-todo-lists       : { lists: [...], activeListId }
+//   - tasks             -> mrp-todos            : [...] (tableau direct)
+//   - lifePlannerActive -> mrp-lifeplanner      : [...] de { start, end, ... } ;
+//     "actives" = période dont l'intervalle [start,end] couvre la date du jour
+//     (pas juste le total de périodes créées, vu le nom "Active").
+//
+// customFoods : AUCUNE clé de données correspondante n'existe aujourd'hui dans
+// l'app (pas de "custom foods" séparé trouvé dans js/05-meals-weight-steps-
+// settings.js ni ailleurs — seules mrp-meals { entries } et weight-entries
+// existent). Plutôt que d'inventer une structure, cette feature reste dans
+// FEATURE_LIMITS (demandé), mais SANS source de comptage : canUseFeature() le
+// signale explicitement via `unsupported: true` au lieu de faire semblant de
+// la compter. Voir rapport.
+// ============================================================================
+const COUNT_SOURCES = {
+  trips: { dataKey: 'mrp-voyages-advanced', extract: v => Array.isArray(v?.trips) ? v.trips.length : 0 },
+  gymSessions: { dataKey: 'mrp-gym-history', extract: v => Array.isArray(v) ? v.length : 0 },
+  transactions: { dataKey: 'mrp-budget', extract: v => Array.isArray(v) ? v.length : 0 },
+  recipes: { dataKey: 'mrp-recipes', extract: v => Array.isArray(v) ? v.length : 0 },
+  lifeGoals: { dataKey: 'mrp-goals', extract: v => Array.isArray(v) ? v.length : 0 },
+  todoLists: { dataKey: 'mrp-todo-lists', extract: v => Array.isArray(v?.lists) ? v.lists.length : 0 },
+  tasks: { dataKey: 'mrp-todos', extract: v => Array.isArray(v) ? v.length : 0 },
+  lifePlannerActive: {
+    dataKey: 'mrp-lifeplanner',
+    extract: v => {
+      if (!Array.isArray(v)) return 0;
+      const todayIso = new Date().toISOString().slice(0, 10);
+      return v.filter(p => p && p.start && p.end && p.start <= todayIso && p.end >= todayIso).length;
+    }
+  }
+};
+
+async function countFeatureUsage(uid, source) {
+  try {
+    const snap = await fsDb().collection('users').doc(uid).collection('data').doc(source.dataKey).get();
+    const value = snap.exists ? snap.data().value : undefined;
+    return source.extract(value);
+  } catch (e) {
+    console.error(`[FEATURES] Lecture Firestore échouée pour ${source.dataKey}`, e);
+    return 0;
+  }
+}
+
+// ============================================================================
+// Limites TEMPORELLES — users/{uid}/usage/{feature-periodKey}, ex.
+// "assistantChat-2026-W34" ou "mealPhotoAnalysis-2026-08" (structure proposée
+// telle quelle dans la demande). Cette étape prépare uniquement la LECTURE :
+// aucune route existante n'incrémente encore ces compteurs (voir rapport),
+// donc used vaudra 0 partout tant que rien n'écrit ce document.
+// ============================================================================
+function getIsoWeekNumber(date) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
+}
+
+function getUsagePeriodKey(window) {
+  const now = new Date();
+  if (window === 'week') return `${now.getUTCFullYear()}-W${String(getIsoWeekNumber(now)).padStart(2, '0')}`;
+  if (window === 'month') return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+  return null;
+}
+
+async function getUsageCount(uid, feature, window) {
+  const periodKey = getUsagePeriodKey(window);
+  if (!periodKey) return 0;
+  try {
+    const docId = `${feature}-${periodKey}`;
+    const snap = await fsDb().collection('users').doc(uid).collection('usage').doc(docId).get();
+    const count = snap.exists ? snap.data().count : 0;
+    return typeof count === 'number' ? count : 0;
+  } catch (e) {
+    console.error(`[FEATURES] Lecture usage échouée pour ${feature}`, e);
+    return 0;
+  }
+}
+
+// Incrémente le compteur d'usage temporel d'une feature — à appeler APRÈS un
+// appel IA réussi (pas avant, pour ne jamais compter un appel qui a échoué).
+// Utilise FieldValue.increment pour rester correct même en cas d'appels
+// concurrents, sans avoir besoin de lire puis d'écrire séparément.
+async function incrementUsageCount(uid, feature, window) {
+  const periodKey = getUsagePeriodKey(window);
+  if (!periodKey) return;
+  try {
+    const docId = `${feature}-${periodKey}`;
+    const ref = fsDb().collection('users').doc(uid).collection('usage').doc(docId);
+    await ref.set({
+      count: admin.firestore.FieldValue.increment(1),
+      feature,
+      periodKey,
+      updatedAt: Date.now()
+    }, { merge: true });
+  } catch (e) {
+    console.error(`[FEATURES] Incrément usage échoué pour ${feature}`, e);
+  }
+}
+
+// ============================================================================
+// canUseFeature — fonction centrale d'autorisation, réutilisable partout.
+// N'écrit rien, ne bloque rien : renvoie juste un résultat structuré. Accepte
+// en option une subscription déjà récupérée pour éviter une lecture Firestore
+// redondante quand plusieurs features sont vérifiées d'affilée (voir
+// /api/subscription/limits ci-dessous).
+// ============================================================================
+async function evaluateFeatureLimit(uid, effectivePlan, feature) {
+  const planLimits = FEATURE_LIMITS[effectivePlan];
+  if (!planLimits || !(feature in planLimits)) {
+    return { allowed: false, reason: 'UNKNOWN_FEATURE', plan: effectivePlan, feature, used: null, limit: null, remaining: null };
+  }
+
+  if (DISPLAY_ONLY_FEATURES.has(feature)) {
+    const limit = planLimits[feature];
+    return {
+      allowed: true, plan: effectivePlan, feature,
+      used: null, limit: limit === Infinity ? null : limit, remaining: null,
+      notApplicable: true // valeur d'affichage (jours d'historique), pas une action à autoriser/refuser
+    };
+  }
+
+  const limitConfig = planLimits[feature];
+  const isTemporal = limitConfig && typeof limitConfig === 'object';
+  const limit = isTemporal ? limitConfig.count : limitConfig;
+
+  let used;
+  if (isTemporal) {
+    used = await getUsageCount(uid, feature, limitConfig.window);
+  } else {
+    const source = COUNT_SOURCES[feature];
+    if (!source) {
+      console.warn(`[FEATURES] Pas de source de comptage pour "${feature}" — vérification ignorée.`);
+      return {
+        allowed: true, plan: effectivePlan, feature,
+        used: null, limit: limit === Infinity ? null : limit, remaining: null,
+        unsupported: true
+      };
+    }
+    used = await countFeatureUsage(uid, source);
+  }
+
+  const unlimited = limit === Infinity;
+  const remaining = unlimited ? null : Math.max(0, limit - used);
+  const allowed = unlimited || used < limit;
+
+  const result = { allowed, plan: effectivePlan, feature, used, limit: unlimited ? null : limit, remaining };
+  if (!allowed) result.reason = 'LIMIT_REACHED';
+  return result;
+}
+
+async function canUseFeature(uid, feature, { subscription } = {}) {
+  const sub = subscription || await getSubscription(uid);
+  const effectivePlan = getEffectivePlan(sub);
+  return evaluateFeatureLimit(uid, effectivePlan, feature);
+}
+
+// ============================================================================
 // Rate limiting des routes IA — chaque appel consomme du quota Gemini payant ;
 // sans limite, un compte compromis (ou un abus involontaire côté frontend, ex.
 // double-clic non bloqué) pourrait générer une facture importante en quelques
@@ -140,7 +470,10 @@ const aiRateLimiter = rateLimit({
 // passer pour un autre utilisateur.
 async function requireFirebaseAuth(req, res, next) {
   if (!firebaseAdminReady) {
-    return res.status(501).json({ error: "Intégration Garmin non configurée sur ce serveur (Firebase Admin manquant).", devMode: true });
+    // Ce middleware protège désormais aussi les routes subscription/admin, pas
+    // seulement Garmin — message généralisé (comportement inchangé : toujours
+    // un 501 devMode tant que FIREBASE_SERVICE_ACCOUNT_JSON n'est pas défini).
+    return res.status(501).json({ error: "Cette fonctionnalité n'est pas encore configurée sur ce serveur (Firebase Admin manquant).", devMode: true });
   }
   const authHeader = req.headers.authorization || '';
   const match = authHeader.match(/^Bearer (.+)$/);
@@ -151,6 +484,40 @@ async function requireFirebaseAuth(req, res, next) {
     next();
   } catch (e) {
     res.status(401).json({ error: 'Session expirée, reconnecte-toi et réessaie.' });
+  }
+}
+
+// ============================================================================
+// requireAdmin — à chaîner APRÈS requireFirebaseAuth sur toute route
+// /api/admin/*. req.uid est déjà posé à ce stade.
+// ----------------------------------------------------------------------------
+// Deux façons d'être reconnu admin (l'une bootstrap, l'autre définitive) :
+//   1. ADMIN_UIDS (variable d'environnement, même mécanisme que
+//      AI_RATE_LIMIT_EXEMPT_UIDS ci-dessus) — sert à démarrer : le tout
+//      premier admin n'a pas de document subscription avec plan:"admin" tant
+//      que personne ne peut encore le lui donner.
+//   2. subscription.plan === "admin" dans Firestore — la voie normale une
+//      fois qu'un premier admin existe (édité manuellement dans Firestore
+//      pour l'instant : aucune route de cette étape ne permet de PROMOUVOIR
+//      quelqu'un admin depuis l'app, volontairement, voir rapport).
+// Un utilisateur ne peut jamais se rendre admin lui-même via ces routes.
+// ============================================================================
+const ADMIN_UIDS = new Set(
+  (process.env.ADMIN_UIDS || '')
+    .split(',')
+    .map(uid => uid.trim())
+    .filter(Boolean)
+);
+
+async function requireAdmin(req, res, next) {
+  try {
+    if (ADMIN_UIDS.has(req.uid)) return next();
+    const subscription = await getSubscription(req.uid);
+    if (isAdmin(subscription)) return next();
+    return res.status(403).json({ error: "Accès administrateur requis." });
+  } catch (e) {
+    console.error('[ADMIN] Vérification des droits admin échouée', e);
+    res.status(500).json({ error: "Vérification des droits administrateur impossible pour le moment." });
   }
 }
 
@@ -465,6 +832,160 @@ async function upsertGarminDailyServerSide(uid, dateIso, values) {
   await ref.set({ value: current });
 }
 
+// ============================================================================
+// GET /api/subscription/status — statut d'abonnement (FREE / PREMIUM / ADMIN)
+// de l'utilisateur connecté.
+// ----------------------------------------------------------------------------
+// Information d'AFFICHAGE / UX uniquement : premiumAccess et isAdmin sont
+// calculés ici pour que le frontend puisse adapter son interface (ex.
+// révéler l'onglet Admin), mais ne sont JAMAIS la protection réelle — chaque
+// route sensible revérifie elle-même côté backend (hasPremiumAccess /
+// requireAdmin). La sécurité du document source reste assurée par les
+// Firestore Security Rules (le frontend ne peut jamais l'écrire directement).
+//
+// Ne renvoie jamais les identifiants Stripe (même null) : uniquement les
+// champs utiles à l'affichage.
+// ============================================================================
+app.get('/api/subscription/status', requireFirebaseAuth, async (req, res) => {
+  console.log('[SUBSCRIPTION] status requested');
+  console.log('[SUBSCRIPTION] user:', req.uid);
+  try {
+    const subscription = await getSubscription(req.uid);
+    res.json({
+      plan: subscription.plan,
+      status: subscription.status,
+      source: subscription.source,
+      expiresAt: subscription.expiresAt,
+      trialStart: subscription.trialStart,
+      trialEnd: subscription.trialEnd,
+      currentPeriodStart: subscription.currentPeriodStart,
+      currentPeriodEnd: subscription.currentPeriodEnd,
+      billingInterval: subscription.billingInterval,
+      premiumAccess: hasPremiumAccess(subscription),
+      isAdmin: ADMIN_UIDS.has(req.uid) || isAdmin(subscription)
+    });
+  } catch (e) {
+    console.error('[SUBSCRIPTION] status route error', e);
+    res.status(500).json({ error: "Impossible de récupérer le statut d'abonnement pour le moment." });
+  }
+});
+
+// ============================================================================
+// GET /api/subscription/limits — used/limit/remaining pour chaque feature du
+// plan effectif de l'utilisateur.
+// ----------------------------------------------------------------------------
+// Destinée UNIQUEMENT à l'affichage / UX (ex. barre "3/20 recettes utilisées").
+// Ce n'est jamais la protection réelle : chaque action sensible devra appeler
+// canUseFeature() elle-même côté backend au moment de l'action (branchement
+// prévu dans une étape ultérieure — voir rapport).
+//
+// Une seule lecture de la subscription, puis les lectures par feature en
+// parallèle (Promise.all) plutôt qu'en série, pour éviter les allers-retours
+// Firestore inutiles (voir §14 performance de la demande).
+// ============================================================================
+app.get('/api/subscription/limits', requireFirebaseAuth, async (req, res) => {
+  try {
+    const subscription = await getSubscription(req.uid);
+    const effectivePlan = getEffectivePlan(subscription);
+    const featureNames = Object.keys(FEATURE_LIMITS[effectivePlan]);
+
+    const results = await Promise.all(
+      featureNames.map(name => evaluateFeatureLimit(req.uid, effectivePlan, name))
+    );
+
+    const features = {};
+    featureNames.forEach((name, i) => {
+      const r = results[i];
+      features[name] = { used: r.used, limit: r.limit, remaining: r.remaining };
+    });
+
+    res.json({ plan: effectivePlan, features });
+  } catch (e) {
+    console.error('[SUBSCRIPTION] limits route error', e);
+    res.status(500).json({ error: "Impossible de récupérer les limites pour le moment." });
+  }
+});
+
+// ============================================================================
+// Administration — offrir/retirer Premium à un utilisateur.
+// ----------------------------------------------------------------------------
+// Toutes les routes /api/admin/* sont protégées par requireFirebaseAuth PUIS
+// requireAdmin : un utilisateur normal qui appelle ces routes (même en
+// construisant la requête à la main) reçoit systématiquement 403, jamais un
+// succès. Rien côté frontend ne peut jamais accorder Premium à qui que ce
+// soit — seul ce backend écrit le document subscription pour cette action.
+// ============================================================================
+const GIFT_DURATIONS = {
+  '7d': 7 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000,
+  '3m': 90 * 24 * 60 * 60 * 1000, // ~3 mois (pas de calendrier mensuel exact ici, cohérent avec "30d")
+  '1y': 365 * 24 * 60 * 60 * 1000,
+  permanent: null
+};
+
+// GET /api/admin/users — liste des comptes (email via Firebase Auth, déjà le
+// système d'auth existant — pas de deuxième annuaire créé) + leur
+// subscription actuelle. Usage personnel/petite échelle : une seule page de
+// jusqu'à 1000 comptes Firebase Auth, largement suffisant ici.
+app.get('/api/admin/users', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  try {
+    const listResult = await admin.auth().listUsers(1000);
+    const authUsers = listResult.users;
+    const subscriptions = await Promise.all(authUsers.map(u => getSubscription(u.uid)));
+    const users = authUsers.map((u, i) => {
+      const s = subscriptions[i];
+      return {
+        uid: u.uid,
+        email: u.email || null,
+        plan: s.plan,
+        status: s.status,
+        source: s.source,
+        expiresAt: s.expiresAt
+      };
+    });
+    res.json({ users });
+  } catch (e) {
+    console.error('[ADMIN] Liste des utilisateurs échouée', e);
+    res.status(500).json({ error: "Impossible de récupérer la liste des utilisateurs." });
+  }
+});
+
+// POST /api/admin/users/:userId/grant-premium  body: { duration }
+app.post('/api/admin/users/:userId/grant-premium', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+  const { duration } = req.body || {};
+  if (!Object.prototype.hasOwnProperty.call(GIFT_DURATIONS, duration)) {
+    return res.status(400).json({ error: "Durée invalide. Attendu : 7d, 30d, 3m, 1y ou permanent." });
+  }
+  try {
+    const ms = GIFT_DURATIONS[duration];
+    const expiresAt = ms == null ? null : new Date(Date.now() + ms).toISOString();
+    const update = { plan: 'premium', status: 'active', source: 'gift', expiresAt, updatedAt: Date.now() };
+    // merge:true : ne touche pas trialStart/trialEnd/stripeCustomerId/etc. déjà
+    // posés à l'étape 2, évite de "recréer" tout le document à chaque don.
+    await fsDb().collection('users').doc(userId).collection('subscription').doc('current').set(update, { merge: true });
+    console.log(`[SUBSCRIPTION] ADMIN ${req.uid} granted PREMIUM to ${userId} (${duration})`);
+    res.json({ success: true, subscription: { ...DEFAULT_SUBSCRIPTION, ...update } });
+  } catch (e) {
+    console.error('[SUBSCRIPTION] grant-premium échoué', e);
+    res.status(500).json({ error: "Impossible d'offrir Premium pour le moment." });
+  }
+});
+
+// POST /api/admin/users/:userId/revoke-premium
+app.post('/api/admin/users/:userId/revoke-premium', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const update = { plan: 'free', status: 'active', source: 'none', expiresAt: null, updatedAt: Date.now() };
+    await fsDb().collection('users').doc(userId).collection('subscription').doc('current').set(update, { merge: true });
+    console.log(`[SUBSCRIPTION] ADMIN ${req.uid} revoked PREMIUM from ${userId}`);
+    res.json({ success: true, subscription: { ...DEFAULT_SUBSCRIPTION, ...update } });
+  } catch (e) {
+    console.error('[SUBSCRIPTION] revoke-premium échoué', e);
+    res.status(500).json({ error: "Impossible de retirer Premium pour le moment." });
+  }
+});
+
 app.post('/api/generate-recipe', requireFirebaseAuth, aiRateLimiter, async (req, res) => {
   try {
     const { ingredients } = req.body || {};
@@ -557,6 +1078,21 @@ const MEAL_PHOTO_MAX_BYTES = 8 * 1024 * 1024;
 
 app.post('/api/analyze-meal-photo', requireFirebaseAuth, aiRateLimiter, async (req, res) => {
   try {
+    // Limite FREE/PREMIUM/ADMIN — même mécanisme que /api/assistant-chat :
+    // FEATURE_LIMITS.mealPhotoAnalysis existait déjà mais n'était pas encore
+    // branché à cette route (aucune vérification ne s'y opposait auparavant).
+    const access = await canUseFeature(req.uid, 'mealPhotoAnalysis');
+    if (!access.allowed) {
+      console.log(`[SUBSCRIPTION] mealPhotoAnalysis limit reached for ${req.uid} (plan=${access.plan})`);
+      return res.status(403).json({
+        error: "Tu as atteint la limite d'analyses de photos de repas pour ton plan actuel.",
+        reason: access.reason,
+        plan: access.plan,
+        limit: access.limit,
+        remaining: access.remaining
+      });
+    }
+
     const { image } = req.body;
     if (!image || typeof image !== 'string') {
       return res.status(400).json({ error: "Aucune image fournie" });
@@ -666,6 +1202,11 @@ app.post('/api/analyze-meal-photo', requireFirebaseAuth, aiRateLimiter, async (r
     const items = Array.isArray(parsed?.items)
       ? parsed.items.filter(it => it && typeof it === 'object' && typeof it.name === 'string' && it.name.trim())
       : [];
+
+    // Incrémenté seulement APRÈS une analyse réussie, comme pour assistantChat :
+    // un appel qui a échoué (503, timeout, photo illisible...) n'est pas compté
+    // contre le quota mensuel de l'utilisateur.
+    await incrementUsageCount(req.uid, 'mealPhotoAnalysis', FEATURE_LIMITS.free.mealPhotoAnalysis.window);
 
     res.json({ success: true, items });
   } catch (error) {
@@ -829,12 +1370,33 @@ app.post('/api/analyze-workout', requireFirebaseAuth, aiRateLimiter, async (req,
 // Pas d'historique conservé côté serveur : le frontend renvoie le message
 // courant à chaque appel (voir assistantConversation côté client) ; on reste
 // donc sans état ici, simple et facile à faire évoluer plus tard.
+//
+// Limite FREE/PREMIUM/ADMIN branchée à cette étape (seule cette route IA est
+// concernée pour l'instant — voir rapport) : réutilise le système de limites
+// déjà posé à l'étape 3 (FEATURE_LIMITS.assistantChat + canUseFeature), lui-
+// même dérivé de hasPremiumAccess()/getEffectivePlan(). L'aiRateLimiter
+// existant (30 appels IA / 15 min, tous endpoints confondus) reste EN PLUS,
+// inchangé : c'est un garde-fou anti-abus général, orthogonal au quota par
+// plan ci-dessous, qui protège spécifiquement contre un coût IA excessif
+// pour un compte Premium offert.
 // ============================================================================
 app.post('/api/assistant-chat', requireFirebaseAuth, aiRateLimiter, async (req, res) => {
   try {
     const { message, context } = req.body || {};
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ error: "Message manquant" });
+    }
+
+    const access = await canUseFeature(req.uid, 'assistantChat');
+    if (!access.allowed) {
+      console.log(`[SUBSCRIPTION] assistantChat limit reached for ${req.uid} (plan=${access.plan})`);
+      return res.status(403).json({
+        error: "Tu as atteint la limite de demandes à l'Assistant pour ton plan actuel.",
+        reason: access.reason,
+        plan: access.plan,
+        limit: access.limit,
+        remaining: access.remaining
+      });
     }
 
     const contextNote = context && context.activeTab
@@ -848,6 +1410,10 @@ app.post('/api/assistant-chat', requireFirebaseAuth, aiRateLimiter, async (req, 
         `objectifs, tâches, finances, recettes, voyages, sport, repas, poids, pas). ` +
         `${contextNote}Réponds de façon utile, concise et en français au message suivant : "${message}"`
     });
+
+    // Incrémenté seulement APRÈS un appel Gemini réussi : un appel qui a
+    // échoué (503, timeout...) n'est pas compté contre le quota de l'utilisateur.
+    await incrementUsageCount(req.uid, 'assistantChat', FEATURE_LIMITS.free.assistantChat.window);
 
     res.json({ success: true, reply: response.text });
   } catch (error) {
@@ -877,6 +1443,24 @@ const VOICE_AUDIO_MAX_BYTES = 8 * 1024 * 1024;
 
 app.post('/api/transcribe-audio', requireFirebaseAuth, aiRateLimiter, async (req, res) => {
   try {
+    // Limite FREE/PREMIUM/ADMIN — FEATURE_LIMITS.assistantVoice existait déjà
+    // mais n'était pas encore branché à cette route, seule assistantChat
+    // l'était. La commande vocale complète (transcription + réponse) consomme
+    // ensuite aussi le quota assistantChat au moment de l'appel à
+    // /api/assistant-chat qui suit côté frontend — les deux quotas restent
+    // indépendants, comme prévu par FEATURE_LIMITS.
+    const access = await canUseFeature(req.uid, 'assistantVoice');
+    if (!access.allowed) {
+      console.log(`[SUBSCRIPTION] assistantVoice limit reached for ${req.uid} (plan=${access.plan})`);
+      return res.status(403).json({
+        error: "Tu as atteint la limite de commandes vocales pour ton plan actuel.",
+        reason: access.reason,
+        plan: access.plan,
+        limit: access.limit,
+        remaining: access.remaining
+      });
+    }
+
     const { audio } = req.body || {};
     if (!audio || typeof audio !== 'string') {
       return res.status(400).json({ error: "Aucun enregistrement audio fourni" });
@@ -947,6 +1531,13 @@ app.post('/api/transcribe-audio', requireFirebaseAuth, aiRateLimiter, async (req
     }
 
     const text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
+
+    // Incrémenté seulement après une transcription réussie (même logique que
+    // mealPhotoAnalysis/assistantChat) — un texte vide (audio silencieux) est
+    // un résultat "réussi" du point de vue de l'appel IA et reste compté,
+    // comme pour toutes les autres routes de ce fichier.
+    await incrementUsageCount(req.uid, 'assistantVoice', FEATURE_LIMITS.free.assistantVoice.window);
+
     res.json({ success: true, text });
   } catch (error) {
     if (error?.isTimeout) {
