@@ -165,6 +165,47 @@ function toDateSafe(value) {
 }
 
 // ============================================================================
+// isAdminUser — SOURCE DE VÉRITÉ UNIQUE pour "cet utilisateur est-il Admin ?",
+// utilisée PARTOUT côté backend (routes /api/admin/*, accès Premium, quotas
+// FEATURE_LIMITS, affichage /api/subscription/status et /limits).
+// ----------------------------------------------------------------------------
+// Deux façons d'être reconnu admin (l'une bootstrap, l'autre définitive) :
+//   1. ADMIN_UIDS (variable d'environnement) — sert à démarrer : le tout
+//      premier admin n'a pas de document subscription avec plan:"admin" tant
+//      que personne ne peut encore le lui donner.
+//   2. subscription.plan === "admin" dans Firestore — la voie normale une
+//      fois qu'un premier admin existe (édité manuellement dans Firestore
+//      pour l'instant : aucune route ne permet de PROMOUVOIR quelqu'un admin
+//      depuis l'app, volontairement).
+//
+// BUG corrigé ici : hasPremiumAccess()/getEffectivePlan() (donc canUseFeature()
+// et tous les quotas Free/Premium, dont l'analyse photo du Meals Tracker) ne
+// vérifiaient JUSQU'ICI que subscription.plan === "admin" — jamais ADMIN_UIDS.
+// Un admin reconnu uniquement via ADMIN_UIDS (bootstrap, sans document
+// Firestore plan:"admin") passait donc bien requireAdmin (routes /api/admin/*)
+// et voyait isAdmin:true côté frontend, mais restait soumis aux limites FREE
+// partout ailleurs (mealPhotoAnalysis, assistantChat, assistantVoice...) — d'où
+// le message de quota atteint malgré un compte Admin. isAdminUser() unifie
+// désormais les deux mécanismes en un seul endroit ; toute vérification admin
+// ou premium du backend doit passer par elle plutôt que retester ADMIN_UIDS ou
+// subscription.plan === "admin" séparément.
+// Un utilisateur ne peut jamais se rendre admin lui-même : ADMIN_UIDS n'est
+// lu que depuis la config serveur, et le document subscription ne peut être
+// écrit que par ce backend (Firestore Security Rules), jamais par le frontend.
+// ============================================================================
+const ADMIN_UIDS = new Set(
+  (process.env.ADMIN_UIDS || '')
+    .split(',')
+    .map(uid => uid.trim())
+    .filter(Boolean)
+);
+
+function isAdminUser(uid, subscription) {
+  const sub = subscription || DEFAULT_SUBSCRIPTION;
+  return ADMIN_UIDS.has(uid) || sub.plan === 'admin';
+}
+
+// ============================================================================
 // hasPremiumAccess — fonction centrale unique décidant si un utilisateur a
 // accès aux fonctionnalités Premium, MAINTENANT. Ne modifie JAMAIS le
 // document Firestore (pas de downgrade automatique écrit ici) : un Premium
@@ -172,16 +213,17 @@ function toDateSafe(value) {
 // requête — le document reste tel quel, contrôlé en temps réel à chaque
 // appel, sans avoir besoin d'un cron pour "corriger" la valeur stockée.
 //
-//   - plan "admin"           → accès Premium toujours accordé (jamais soumis
-//                               à expiresAt : un rôle admin ne "périme" pas).
+//   - Admin (isAdminUser, ADMIN_UIDS OU plan "admin") → accès Premium
+//     toujours accordé (jamais soumis à expiresAt : un rôle admin ne
+//     "périme" pas).
 //   - plan "premium", actif  → accès accordé si pas d'expiration dépassée.
 //     L'expiration pertinente dépend du statut : trialEnd pendant un essai,
 //     sinon expiresAt (cadeau admin, ou futur renouvellement payant).
 //   - tout le reste (dont "free")            → pas d'accès.
 // ============================================================================
-function hasPremiumAccess(subscription) {
+function hasPremiumAccess(uid, subscription) {
   const sub = subscription || DEFAULT_SUBSCRIPTION;
-  if (sub.plan === 'admin') return true;
+  if (isAdminUser(uid, sub)) return true;
   if (sub.plan !== 'premium') return false;
   if (sub.status !== 'active' && sub.status !== 'trialing') return false;
 
@@ -193,19 +235,11 @@ function hasPremiumAccess(subscription) {
   return true; // pas d'expiration = permanent
 }
 
-// Rôle admin — distinct de l'accès Premium (un admin A un accès Premium via
-// hasPremiumAccess, mais isAdmin sert à protéger les routes /api/admin/*
-// elles-mêmes, où "a accès aux fonctionnalités Premium" ne suffit pas).
-function isAdmin(subscription) {
-  const sub = subscription || DEFAULT_SUBSCRIPTION;
-  return sub.plan === 'admin';
-}
-
 // Plan effectif "free"/"premium" utilisé par le système de limites de
 // l'étape 3 (FEATURE_LIMITS n'a que ces deux clés) — admin s'y range du côté
 // premium via hasPremiumAccess, sans dupliquer la logique d'expiration.
-function getEffectivePlan(subscription) {
-  return hasPremiumAccess(subscription) ? 'premium' : 'free';
+function getEffectivePlan(uid, subscription) {
+  return hasPremiumAccess(uid, subscription) ? 'premium' : 'free';
 }
 
 // ============================================================================
@@ -424,7 +458,7 @@ async function evaluateFeatureLimit(uid, effectivePlan, feature) {
 
 async function canUseFeature(uid, feature, { subscription } = {}) {
   const sub = subscription || await getSubscription(uid);
-  const effectivePlan = getEffectivePlan(sub);
+  const effectivePlan = getEffectivePlan(uid, sub);
   return evaluateFeatureLimit(uid, effectivePlan, feature);
 }
 
@@ -491,29 +525,14 @@ async function requireFirebaseAuth(req, res, next) {
 // requireAdmin — à chaîner APRÈS requireFirebaseAuth sur toute route
 // /api/admin/*. req.uid est déjà posé à ce stade.
 // ----------------------------------------------------------------------------
-// Deux façons d'être reconnu admin (l'une bootstrap, l'autre définitive) :
-//   1. ADMIN_UIDS (variable d'environnement, même mécanisme que
-//      AI_RATE_LIMIT_EXEMPT_UIDS ci-dessus) — sert à démarrer : le tout
-//      premier admin n'a pas de document subscription avec plan:"admin" tant
-//      que personne ne peut encore le lui donner.
-//   2. subscription.plan === "admin" dans Firestore — la voie normale une
-//      fois qu'un premier admin existe (édité manuellement dans Firestore
-//      pour l'instant : aucune route de cette étape ne permet de PROMOUVOIR
-//      quelqu'un admin depuis l'app, volontairement, voir rapport).
-// Un utilisateur ne peut jamais se rendre admin lui-même via ces routes.
+// Réutilise isAdminUser() (définie plus haut, source de vérité unique pour
+// ADMIN_UIDS + subscription.plan === "admin") plutôt que de retester les deux
+// mécanismes ici séparément.
 // ============================================================================
-const ADMIN_UIDS = new Set(
-  (process.env.ADMIN_UIDS || '')
-    .split(',')
-    .map(uid => uid.trim())
-    .filter(Boolean)
-);
-
 async function requireAdmin(req, res, next) {
   try {
-    if (ADMIN_UIDS.has(req.uid)) return next();
     const subscription = await getSubscription(req.uid);
-    if (isAdmin(subscription)) return next();
+    if (isAdminUser(req.uid, subscription)) return next();
     return res.status(403).json({ error: "Accès administrateur requis." });
   } catch (e) {
     console.error('[ADMIN] Vérification des droits admin échouée', e);
@@ -861,8 +880,8 @@ app.get('/api/subscription/status', requireFirebaseAuth, async (req, res) => {
       currentPeriodStart: subscription.currentPeriodStart,
       currentPeriodEnd: subscription.currentPeriodEnd,
       billingInterval: subscription.billingInterval,
-      premiumAccess: hasPremiumAccess(subscription),
-      isAdmin: ADMIN_UIDS.has(req.uid) || isAdmin(subscription)
+      premiumAccess: hasPremiumAccess(req.uid, subscription),
+      isAdmin: isAdminUser(req.uid, subscription)
     });
   } catch (e) {
     console.error('[SUBSCRIPTION] status route error', e);
@@ -886,7 +905,7 @@ app.get('/api/subscription/status', requireFirebaseAuth, async (req, res) => {
 app.get('/api/subscription/limits', requireFirebaseAuth, async (req, res) => {
   try {
     const subscription = await getSubscription(req.uid);
-    const effectivePlan = getEffectivePlan(subscription);
+    const effectivePlan = getEffectivePlan(req.uid, subscription);
     const featureNames = Object.keys(FEATURE_LIMITS[effectivePlan]);
 
     const results = await Promise.all(
