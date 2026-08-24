@@ -165,47 +165,6 @@ function toDateSafe(value) {
 }
 
 // ============================================================================
-// isAdminUser — SOURCE DE VÉRITÉ UNIQUE pour "cet utilisateur est-il Admin ?",
-// utilisée PARTOUT côté backend (routes /api/admin/*, accès Premium, quotas
-// FEATURE_LIMITS, affichage /api/subscription/status et /limits).
-// ----------------------------------------------------------------------------
-// Deux façons d'être reconnu admin (l'une bootstrap, l'autre définitive) :
-//   1. ADMIN_UIDS (variable d'environnement) — sert à démarrer : le tout
-//      premier admin n'a pas de document subscription avec plan:"admin" tant
-//      que personne ne peut encore le lui donner.
-//   2. subscription.plan === "admin" dans Firestore — la voie normale une
-//      fois qu'un premier admin existe (édité manuellement dans Firestore
-//      pour l'instant : aucune route ne permet de PROMOUVOIR quelqu'un admin
-//      depuis l'app, volontairement).
-//
-// BUG corrigé ici : hasPremiumAccess()/getEffectivePlan() (donc canUseFeature()
-// et tous les quotas Free/Premium, dont l'analyse photo du Meals Tracker) ne
-// vérifiaient JUSQU'ICI que subscription.plan === "admin" — jamais ADMIN_UIDS.
-// Un admin reconnu uniquement via ADMIN_UIDS (bootstrap, sans document
-// Firestore plan:"admin") passait donc bien requireAdmin (routes /api/admin/*)
-// et voyait isAdmin:true côté frontend, mais restait soumis aux limites FREE
-// partout ailleurs (mealPhotoAnalysis, assistantChat, assistantVoice...) — d'où
-// le message de quota atteint malgré un compte Admin. isAdminUser() unifie
-// désormais les deux mécanismes en un seul endroit ; toute vérification admin
-// ou premium du backend doit passer par elle plutôt que retester ADMIN_UIDS ou
-// subscription.plan === "admin" séparément.
-// Un utilisateur ne peut jamais se rendre admin lui-même : ADMIN_UIDS n'est
-// lu que depuis la config serveur, et le document subscription ne peut être
-// écrit que par ce backend (Firestore Security Rules), jamais par le frontend.
-// ============================================================================
-const ADMIN_UIDS = new Set(
-  (process.env.ADMIN_UIDS || '')
-    .split(',')
-    .map(uid => uid.trim())
-    .filter(Boolean)
-);
-
-function isAdminUser(uid, subscription) {
-  const sub = subscription || DEFAULT_SUBSCRIPTION;
-  return ADMIN_UIDS.has(uid) || sub.plan === 'admin';
-}
-
-// ============================================================================
 // hasPremiumAccess — fonction centrale unique décidant si un utilisateur a
 // accès aux fonctionnalités Premium, MAINTENANT. Ne modifie JAMAIS le
 // document Firestore (pas de downgrade automatique écrit ici) : un Premium
@@ -213,17 +172,16 @@ function isAdminUser(uid, subscription) {
 // requête — le document reste tel quel, contrôlé en temps réel à chaque
 // appel, sans avoir besoin d'un cron pour "corriger" la valeur stockée.
 //
-//   - Admin (isAdminUser, ADMIN_UIDS OU plan "admin") → accès Premium
-//     toujours accordé (jamais soumis à expiresAt : un rôle admin ne
-//     "périme" pas).
+//   - plan "admin"           → accès Premium toujours accordé (jamais soumis
+//                               à expiresAt : un rôle admin ne "périme" pas).
 //   - plan "premium", actif  → accès accordé si pas d'expiration dépassée.
 //     L'expiration pertinente dépend du statut : trialEnd pendant un essai,
 //     sinon expiresAt (cadeau admin, ou futur renouvellement payant).
 //   - tout le reste (dont "free")            → pas d'accès.
 // ============================================================================
-function hasPremiumAccess(uid, subscription) {
+function hasPremiumAccess(subscription) {
   const sub = subscription || DEFAULT_SUBSCRIPTION;
-  if (isAdminUser(uid, sub)) return true;
+  if (sub.plan === 'admin') return true;
   if (sub.plan !== 'premium') return false;
   if (sub.status !== 'active' && sub.status !== 'trialing') return false;
 
@@ -235,11 +193,19 @@ function hasPremiumAccess(uid, subscription) {
   return true; // pas d'expiration = permanent
 }
 
+// Rôle admin — distinct de l'accès Premium (un admin A un accès Premium via
+// hasPremiumAccess, mais isAdmin sert à protéger les routes /api/admin/*
+// elles-mêmes, où "a accès aux fonctionnalités Premium" ne suffit pas).
+function isAdmin(subscription) {
+  const sub = subscription || DEFAULT_SUBSCRIPTION;
+  return sub.plan === 'admin';
+}
+
 // Plan effectif "free"/"premium" utilisé par le système de limites de
 // l'étape 3 (FEATURE_LIMITS n'a que ces deux clés) — admin s'y range du côté
 // premium via hasPremiumAccess, sans dupliquer la logique d'expiration.
-function getEffectivePlan(uid, subscription) {
-  return hasPremiumAccess(uid, subscription) ? 'premium' : 'free';
+function getEffectivePlan(subscription) {
+  return hasPremiumAccess(subscription) ? 'premium' : 'free';
 }
 
 // ============================================================================
@@ -458,7 +424,7 @@ async function evaluateFeatureLimit(uid, effectivePlan, feature) {
 
 async function canUseFeature(uid, feature, { subscription } = {}) {
   const sub = subscription || await getSubscription(uid);
-  const effectivePlan = getEffectivePlan(uid, sub);
+  const effectivePlan = getEffectivePlan(sub);
   return evaluateFeatureLimit(uid, effectivePlan, feature);
 }
 
@@ -525,14 +491,29 @@ async function requireFirebaseAuth(req, res, next) {
 // requireAdmin — à chaîner APRÈS requireFirebaseAuth sur toute route
 // /api/admin/*. req.uid est déjà posé à ce stade.
 // ----------------------------------------------------------------------------
-// Réutilise isAdminUser() (définie plus haut, source de vérité unique pour
-// ADMIN_UIDS + subscription.plan === "admin") plutôt que de retester les deux
-// mécanismes ici séparément.
+// Deux façons d'être reconnu admin (l'une bootstrap, l'autre définitive) :
+//   1. ADMIN_UIDS (variable d'environnement, même mécanisme que
+//      AI_RATE_LIMIT_EXEMPT_UIDS ci-dessus) — sert à démarrer : le tout
+//      premier admin n'a pas de document subscription avec plan:"admin" tant
+//      que personne ne peut encore le lui donner.
+//   2. subscription.plan === "admin" dans Firestore — la voie normale une
+//      fois qu'un premier admin existe (édité manuellement dans Firestore
+//      pour l'instant : aucune route de cette étape ne permet de PROMOUVOIR
+//      quelqu'un admin depuis l'app, volontairement, voir rapport).
+// Un utilisateur ne peut jamais se rendre admin lui-même via ces routes.
 // ============================================================================
+const ADMIN_UIDS = new Set(
+  (process.env.ADMIN_UIDS || '')
+    .split(',')
+    .map(uid => uid.trim())
+    .filter(Boolean)
+);
+
 async function requireAdmin(req, res, next) {
   try {
+    if (ADMIN_UIDS.has(req.uid)) return next();
     const subscription = await getSubscription(req.uid);
-    if (isAdminUser(req.uid, subscription)) return next();
+    if (isAdmin(subscription)) return next();
     return res.status(403).json({ error: "Accès administrateur requis." });
   } catch (e) {
     console.error('[ADMIN] Vérification des droits admin échouée', e);
@@ -880,8 +861,8 @@ app.get('/api/subscription/status', requireFirebaseAuth, async (req, res) => {
       currentPeriodStart: subscription.currentPeriodStart,
       currentPeriodEnd: subscription.currentPeriodEnd,
       billingInterval: subscription.billingInterval,
-      premiumAccess: hasPremiumAccess(req.uid, subscription),
-      isAdmin: isAdminUser(req.uid, subscription)
+      premiumAccess: hasPremiumAccess(subscription),
+      isAdmin: ADMIN_UIDS.has(req.uid) || isAdmin(subscription)
     });
   } catch (e) {
     console.error('[SUBSCRIPTION] status route error', e);
@@ -905,7 +886,7 @@ app.get('/api/subscription/status', requireFirebaseAuth, async (req, res) => {
 app.get('/api/subscription/limits', requireFirebaseAuth, async (req, res) => {
   try {
     const subscription = await getSubscription(req.uid);
-    const effectivePlan = getEffectivePlan(req.uid, subscription);
+    const effectivePlan = getEffectivePlan(subscription);
     const featureNames = Object.keys(FEATURE_LIMITS[effectivePlan]);
 
     const results = await Promise.all(
@@ -1243,6 +1224,189 @@ app.post('/api/analyze-meal-photo', requireFirebaseAuth, aiRateLimiter, async (r
       return res.status(429).json({ error: "Le quota d'analyses IA est temporairement dépassé. Réessaie plus tard." });
     }
     console.error('analyze-meal-photo error', error);
+    res.status(500).json({ error: "L'analyse a échoué. Réessaie plus tard." });
+  }
+});
+
+// ============================================================================
+// Meals Tracker — analyse IA d'une description texte de repas.
+// ----------------------------------------------------------------------------
+// Alternative à /api/analyze-meal-photo ci-dessus, pour les cas où l'utilisateur
+// préfère décrire son repas plutôt que d'en prendre une photo. Réutilise
+// VOLONTAIREMENT :
+//   - le même quota que l'analyse photo (FEATURE_LIMITS.mealPhotoAnalysis) —
+//     ce n'est pas une feature séparée du point de vue du plan/abonnement,
+//     juste une autre façon d'alimenter la même fonctionnalité "Analyse IA
+//     Meals Tracker" ; pas de nouveau compteur, pas de nouvelle clé Firestore.
+//   - le même format de sortie `items` que /api/analyze-meal-photo (name,
+//     quantity, calories, protein, carbs, fat, confidence), pour que le
+//     frontend puisse réutiliser telle quelle toute la UI de vérification/
+//     correction déjà écrite pour l'analyse photo (renderMealAiResults,
+//     confirmAddMealAiResults, etc. — voir js/05-meals-weight-steps-settings.js).
+// Deux champs en plus de ce format commun, propres à l'analyse texte :
+//   - needsClarification / clarificationQuestion : la description peut être
+//     trop vague pour être exploitée (ex. "j'ai mangé quelque chose") ; dans
+//     ce cas l'IA ne doit PAS inventer un repas, elle doit demander une
+//     précision. Le frontend renvoie alors une description enrichie
+//     (originale + question + réponse de l'utilisateur) sur un nouvel appel.
+//   - totalFiber/totalSugar/totalSaturatedFat/totalSodium/estimationNote :
+//     informations supplémentaires demandées, PUREMENT informatives — elles ne
+//     sont pas persistées dans mealsData.entries (qui ne connaît que calories/
+//     protein/carbs/fat), volontairement, pour ne pas créer une structure de
+//     sauvegarde parallèle à celle déjà utilisée par tout le reste du Meals
+//     Tracker (voir rapport).
+// ============================================================================
+app.post('/api/analyze-meal-text', requireFirebaseAuth, aiRateLimiter, async (req, res) => {
+  try {
+    // Même feature ("mealPhotoAnalysis") et donc même quota FREE/PREMIUM/ADMIN
+    // que l'analyse photo — voir commentaire ci-dessus.
+    const access = await canUseFeature(req.uid, 'mealPhotoAnalysis');
+    if (!access.allowed) {
+      console.log(`[SUBSCRIPTION] mealPhotoAnalysis (texte) limit reached for ${req.uid} (plan=${access.plan})`);
+      return res.status(403).json({
+        error: "Tu as atteint la limite d'analyses de repas pour ton plan actuel.",
+        reason: access.reason,
+        plan: access.plan,
+        limit: access.limit,
+        remaining: access.remaining
+      });
+    }
+
+    const { description } = req.body || {};
+    if (!description || typeof description !== 'string' || !description.trim()) {
+      return res.status(400).json({ error: "Décris ce que tu as mangé avant de lancer l'analyse." });
+    }
+    const trimmed = description.trim();
+    if (trimmed.length < 3) {
+      return res.status(400).json({ error: "Ta description est trop courte pour être analysée. Ajoute un peu plus de détails." });
+    }
+    // Même logique de garde-fou que /api/generate-recipe (coût/latence Gemini),
+    // avec une marge plus large car une description de repas + une éventuelle
+    // précision de clarification peuvent être plus longues qu'une liste d'ingrédients.
+    if (trimmed.length > 1500) {
+      return res.status(400).json({ error: "Ta description est trop longue (1500 caractères max)." });
+    }
+
+    const response = await withTimeout(
+      generateContentWithRetry({
+        model: 'gemini-3.5-flash-lite',
+        contents:
+          `Description du repas rédigée par l'utilisateur : "${trimmed}"\n\n` +
+          "Analyse cette description et identifie chaque aliment mentionné (nom, quantité/portion, " +
+          "méthode de préparation si indiquée). Pour chaque aliment, fournis une ESTIMATION " +
+          "OBLIGATOIRE de ses calories (kcal), protéines, glucides et lipides (en grammes), basée " +
+          "sur des valeurs nutritionnelles typiques. Si l'utilisateur n'a pas donné de quantité " +
+          "précise, estime une portion standard raisonnable et indique 'low' comme confidence pour " +
+          "cet aliment (ne prétends jamais connaître une quantité non fournie). Fournis aussi, si " +
+          "elles sont raisonnablement estimables à partir des aliments identifiés, les fibres, sucres, " +
+          "graisses saturées et sodium TOTAUX du repas (sinon laisse ces champs à 0). " +
+          "Si la description est vraiment trop vague pour identifier ne serait-ce qu'un aliment " +
+          "(ex. \"j'ai mangé quelque chose\", \"un truc rapide\"), NE FOURNIS AUCUN item : mets " +
+          "needsClarification à true et pose UNE question courte et précise pour obtenir " +
+          "l'information manquante. Si tu peux estimer même approximativement à partir de ce qui " +
+          "est écrit, ne demande PAS de clarification — fournis un résultat avec confidence 'low' " +
+          "plutôt que de bloquer l'utilisateur.",
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              needsClarification: { type: Type.BOOLEAN },
+              clarificationQuestion: { type: Type.STRING },
+              items: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    name: { type: Type.STRING },
+                    quantity: { type: Type.STRING },
+                    calories: { type: Type.NUMBER },
+                    protein: { type: Type.NUMBER },
+                    carbs: { type: Type.NUMBER },
+                    fat: { type: Type.NUMBER },
+                    confidence: { type: Type.STRING }
+                  },
+                  required: ["name", "quantity", "calories", "protein", "carbs", "fat", "confidence"]
+                }
+              },
+              totalFiber: { type: Type.NUMBER },
+              totalSugar: { type: Type.NUMBER },
+              totalSaturatedFat: { type: Type.NUMBER },
+              totalSodium: { type: Type.NUMBER },
+              estimationNote: { type: Type.STRING }
+            },
+            required: ["needsClarification", "items"]
+          }
+        }
+      }),
+      25000,
+      "L'analyse prend trop de temps. Vérifie ta connexion et réessaie."
+    );
+
+    // Même contrôle que /api/analyze-meal-photo : réponse bloquée par le filtre
+    // de sécurité ou aucun candidat exploitable -> response.text vide/undefined.
+    const blockReason = response.promptFeedback?.blockReason;
+    const finishReason = response.candidates?.[0]?.finishReason;
+    if (!response.text) {
+      console.error('analyze-meal-text: réponse vide de Gemini', { blockReason, finishReason });
+      const msg = blockReason || finishReason === 'SAFETY'
+        ? "Cette description n'a pas pu être analysée (filtre de sécurité). Reformule-la."
+        : "L'IA n'a pas pu analyser cette description. Réessaie en la reformulant.";
+      return res.status(422).json({ error: msg });
+    }
+
+    let parsed;
+    try {
+      const cleanText = response.text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+      parsed = JSON.parse(cleanText);
+    } catch (parseErr) {
+      console.error('analyze-meal-text: réponse Gemini non-JSON', response.text, parseErr);
+      return res.status(502).json({ error: "L'IA a renvoyé une réponse inattendue. Réessaie." });
+    }
+
+    const needsClarification = parsed?.needsClarification === true;
+    // Un item sans nom exploitable est ignoré, comme pour l'analyse photo.
+    const items = Array.isArray(parsed?.items)
+      ? parsed.items.filter(it => it && typeof it === 'object' && typeof it.name === 'string' && it.name.trim())
+      : [];
+
+    if (!needsClarification && !items.length) {
+      // Ni clarification demandée, ni aliment identifié : réponse inexploitable,
+      // à traiter comme une absence de données plutôt que comme un repas vide.
+      return res.status(422).json({ error: "Aucun aliment n'a pu être identifié dans cette description. Essaie d'être plus précis (aliments, quantités)." });
+    }
+
+    // Incrémenté après toute réponse exploitable de Gemini (y compris une
+    // demande de clarification), comme /api/analyze-meal-photo : seul un appel
+    // qui a réellement échoué (503, timeout, JSON invalide...) n'est pas compté.
+    await incrementUsageCount(req.uid, 'mealPhotoAnalysis', FEATURE_LIMITS.free.mealPhotoAnalysis.window);
+
+    res.json({
+      success: true,
+      needsClarification,
+      clarificationQuestion: needsClarification ? (parsed.clarificationQuestion || "Peux-tu préciser ce que tu as mangé ?") : null,
+      items,
+      totalFiber: Number(parsed?.totalFiber) || 0,
+      totalSugar: Number(parsed?.totalSugar) || 0,
+      totalSaturatedFat: Number(parsed?.totalSaturatedFat) || 0,
+      totalSodium: Number(parsed?.totalSodium) || 0,
+      estimationNote: typeof parsed?.estimationNote === 'string' ? parsed.estimationNote : ''
+    });
+  } catch (error) {
+    if (error?.isTimeout) {
+      console.error('analyze-meal-text: timeout dépassé', error.message);
+      return res.status(504).json({ error: error.message });
+    }
+    const status = error?.error?.status || error?.status;
+    if (status === 'UNAVAILABLE' || error?.error?.code === 503) {
+      console.error('analyze-meal-text: Gemini indisponible après plusieurs tentatives', error);
+      return res.status(503).json({ error: "L'IA est temporairement surchargée. Réessaie dans quelques instants." });
+    }
+    if (status === 'RESOURCE_EXHAUSTED' || error?.error?.code === 429) {
+      console.error('analyze-meal-text: quota Gemini dépassé', error);
+      return res.status(429).json({ error: "Le quota d'analyses IA est temporairement dépassé. Réessaie plus tard." });
+    }
+    console.error('analyze-meal-text error', error);
     res.status(500).json({ error: "L'analyse a échoué. Réessaie plus tard." });
   }
 });
