@@ -1742,4 +1742,310 @@ app.post('/api/transcribe-audio', requireFirebaseAuth, aiRateLimiter, async (req
 });
 
 const PORT = process.env.PORT || 3000;
+
+// ============================================================================
+// Complément Prompt 13 — Notifications programmées à heure fixe (FCM)
+// ----------------------------------------------------------------------------
+// Réutilise scrupuleusement ce qui existe déjà : mêmes 5 catégories et mêmes
+// conditions métier ("SI") que NOTIFICATION_CATEGORIES côté frontend (voir
+// js/05-meals-weight-steps-settings.js) — seul le "QUAND" change ici (heures
+// fixes au lieu d'une fenêtre). Ce backend ne fait que LIRE les mêmes clés
+// Firestore que dbGet/dbSet écrit déjà (users/{uid}/data/{clé}) — il n'écrit
+// jamais ces documents, sauf mrp-fcm-devices pour retirer un token invalide
+// (section 11 du Prompt 13) via la Firestore Security Rule déjà en place pour
+// ce chemin (accès Admin SDK, hors règles client de toute façon).
+//
+// Horaires fixes (heure LOCALE de chaque utilisateur, voir mrp-timezone) :
+//   Life Goals    : 08:00
+//   To Do         : 10:30, 14:30
+//   Meals Tracker : 07:30, 12:30, 19:00
+//   Gym / Muscu   : 18:30, 21:30
+//   Steps         : 20:00
+// ============================================================================
+const DEFAULT_TODO_LIST_ID = 'default';
+const DASHBOARD_MEAL_SLOTS = ['Petit-déjeuner', 'Déjeuner', 'Dîner'];
+// Fuseau de secours UNIQUEMENT pour un utilisateur qui ne s'est pas encore
+// reconnecté depuis la mise à jour qui détecte son fuseau (voir mrp-timezone,
+// js/05-...) — jamais imposé si un fuseau réel est déjà enregistré (section 17).
+const FALLBACK_TIMEZONE = 'Europe/Zurich';
+
+const NOTIFICATION_SCHEDULE = [
+  {
+    id: 'meals', tab: 'meals', settingsFlag: 'mealsReminder', title: '🍽️ Meals',
+    times: ['07:30', '12:30', '19:00'],
+    isRelevant: (d) => (d.meals.total - d.meals.loggedTypes.size) > 0,
+    build: (d) => {
+      const missing = d.meals.total - d.meals.loggedTypes.size;
+      return missing === 1
+        ? `Tu n'as pas encore enregistré ton ${(d.meals.nextSlot || '').toLowerCase()}.`
+        : `Tu as ${missing} repas à enregistrer aujourd'hui.`;
+    }
+  },
+  {
+    id: 'workout', tab: 'gym', settingsFlag: 'gymReminder', title: '🏋️ Workout',
+    times: ['18:30', '21:30'],
+    isRelevant: (d) => d.gym.total > 0 && d.gym.done < d.gym.total,
+    build: (d) => {
+      const pending = d.gym.sessions.filter(s => s && !s.checked);
+      const names = pending.map(s => s.name).filter(Boolean);
+      return names.length > 1
+        ? `Tu as ${names.length} séances encore prévues aujourd'hui.`
+        : `${names[0] || 'Ta séance'} t'attend aujourd'hui 💪`;
+    }
+  },
+  {
+    id: 'todos', tab: 'todo', settingsFlag: 'todosReminder', title: '✅ Tâches',
+    times: ['10:30', '14:30'],
+    isRelevant: (d) => d.todos.pending.length > 0,
+    build: (d) => {
+      const pending = d.todos.pending;
+      if (pending.length === 1) return `Il te reste une tâche à terminer : ${pending[0].text}`;
+      const top = d.todos.top;
+      const suffix = (top && top.priority === 'Haute') ? ' Une tâche importante t\'attend en priorité.' : '';
+      return `Tu as ${pending.length} tâches à terminer aujourd'hui.${suffix}`;
+    }
+  },
+  {
+    id: 'goals', tab: 'objectifs', settingsFlag: 'goalsReminder', title: '🎯 Life Goal',
+    times: ['08:00'],
+    isRelevant: (d) => !!d.goals.focus && (d.goals.focus.progress || 0) < 100,
+    build: (d) => `N'oublie pas d'avancer sur ton objectif : ${d.goals.focus.title}`
+  },
+  {
+    id: 'steps', tab: 'steps', settingsFlag: 'stepsReminder', title: '🚶 Steps',
+    times: ['20:00'],
+    isRelevant: (d) => d.steps.goal > 0 && d.steps.today < d.steps.goal,
+    build: (d) => {
+      const remaining = Math.max(0, d.steps.goal - d.steps.today);
+      return `Plus que ${remaining.toLocaleString('fr-FR')} pas pour atteindre ton objectif.`;
+    }
+  }
+];
+
+// Heure locale + date locale (pour la déduplication) + jour de la semaine en
+// français (pour indexer gymPlan, voir getTodayGymDay() dans js/04-gym.js) —
+// tout calculé dans le fuseau IANA de l'utilisateur, jamais celui du serveur.
+const WEEKDAY_EN_TO_FR = { sunday: 'dimanche', monday: 'lundi', tuesday: 'mardi', wednesday: 'mercredi', thursday: 'jeudi', friday: 'vendredi', saturday: 'samedi' };
+function getLocalContext(timezone) {
+  const tz = timezone || FALLBACK_TIMEZONE;
+  const now = new Date();
+  const formatterOptions = {
+    hour12: false, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', weekday: 'long'
+  };
+  let parts;
+  try {
+    parts = new Intl.DateTimeFormat('en-CA', { ...formatterOptions, timeZone: tz }).formatToParts(now);
+  } catch (e) {
+    // Fuseau invalide/corrompu pour cet utilisateur : repli sur le fuseau par
+    // défaut plutôt que de faire échouer tout le cycle pour les autres utilisateurs.
+    parts = new Intl.DateTimeFormat('en-CA', { ...formatterOptions, timeZone: FALLBACK_TIMEZONE }).formatToParts(now);
+  }
+  const get = (type) => parts.find(p => p.type === type)?.value;
+  return {
+    dateIso: `${get('year')}-${get('month')}-${get('day')}`,
+    hhmm: `${get('hour')}:${get('minute')}`,
+    weekdayFr: WEEKDAY_EN_TO_FR[(get('weekday') || '').toLowerCase()] || 'lundi'
+  };
+}
+
+// Reconstruit, à partir des documents Firestore bruts (users/{uid}/data/{clé}),
+// EXACTEMENT le même instantané que DashboardDataService() côté frontend (voir
+// 01-core-home-goals-todos.js) — pour que "SI" une notification est pertinente
+// reste identique, que la décision soit prise par le navigateur (onglet ouvert)
+// ou par ce backend (app fermée).
+async function buildServerDashboardData(uid, dateIso, weekdayFr) {
+  const dataCol = fsDb().collection('users').doc(uid).collection('data');
+  const [gymSnap, todosSnap, goalsSnap, activeGoalSnap, mealsSnap, stepsSnap] = await Promise.all([
+    dataCol.doc('mrp-gym').get(),
+    dataCol.doc('mrp-todos').get(),
+    dataCol.doc('mrp-goals').get(),
+    dataCol.doc('mrp-active-goal').get(),
+    dataCol.doc('mrp-meals').get(),
+    dataCol.doc('mrp-steps').get()
+  ]);
+
+  const gymPlan = gymSnap.exists ? (gymSnap.data().value || {}) : {};
+  const gymToday = Array.isArray(gymPlan[weekdayFr]) ? gymPlan[weekdayFr] : [];
+  const gymDone = gymToday.filter(s => s && s.checked).length;
+
+  const todos = todosSnap.exists ? (todosSnap.data().value || []) : [];
+  const todayListTodos = (Array.isArray(todos) ? todos : []).filter(t => t && t.listId === DEFAULT_TODO_LIST_ID);
+  const pendingTodos = todayListTodos.filter(t => !t.done);
+  const priorityOrder = { 'Haute': 0, 'Normale': 1, 'Basse': 2 };
+  const topTodo = [...pendingTodos].sort((a, b) => (priorityOrder[a.priority] ?? 1) - (priorityOrder[b.priority] ?? 1))[0] || null;
+
+  const goals = goalsSnap.exists ? (goalsSnap.data().value || []) : [];
+  const activeGoalId = activeGoalSnap.exists ? activeGoalSnap.data().value : null;
+  const focusGoal = activeGoalId ? ((Array.isArray(goals) ? goals : []).find(g => g && g.id === activeGoalId) || null) : null;
+
+  const mealsData = mealsSnap.exists ? (mealsSnap.data().value || { entries: [] }) : { entries: [] };
+  const todayMealEntries = (mealsData.entries || []).filter(e => e && e.date === dateIso);
+  const loggedMealTypes = new Set(todayMealEntries.map(e => e.type));
+  const nextMealSlot = DASHBOARD_MEAL_SLOTS.find(slot => !loggedMealTypes.has(slot)) || null;
+
+  const stepsData = stepsSnap.exists ? (stepsSnap.data().value || { entries: [], goal: 0 }) : { entries: [], goal: 0 };
+  const todaySteps = ((stepsData.entries || []).find(e => e && e.date === dateIso) || {}).steps || 0;
+
+  return {
+    gym: { sessions: gymToday, done: gymDone, total: gymToday.length },
+    todos: { pending: pendingTodos, total: todayListTodos.length, top: topTodo },
+    goals: { focus: focusGoal },
+    meals: { loggedTypes: loggedMealTypes, total: DASHBOARD_MEAL_SLOTS.length, nextSlot: nextMealSlot },
+    steps: { today: todaySteps, goal: stepsData.goal || 0 }
+  };
+}
+
+// Idempotence (section 7 du complément) : un document est CRÉÉ (jamais mis à
+// jour) pour chaque occurrence exacte (utilisateur + catégorie + date locale +
+// heure programmée). .create() échoue si le document existe déjà — la garantie
+// est donc atomique même si ce cycle tourne deux fois ou qu'un ancien process
+// se chevauche avec le nouveau après un redéploiement.
+async function claimNotificationOccurrence(uid, catId, dateIso, time) {
+  const id = `${uid}_${catId}_${dateIso}_${time}`;
+  try {
+    await fsDb().collection('notificationOccurrences').doc(id).create({
+      uid, catId, dateIso, time, sentAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    return true;
+  } catch (e) {
+    if (e && (e.code === 6 || e.code === 'already-exists')) return false; // déjà traitée
+    console.error('[NOTIF] claimNotificationOccurrence a échoué', uid, catId, e);
+    return false; // par prudence : on n'envoie pas si l'idempotence n'a pas pu être vérifiée
+  }
+}
+
+// Envoie le Push à TOUS les appareils enregistrés de l'utilisateur (section 10 :
+// multi-appareils) et retire uniquement le(s) token(s) devenu(s) invalide(s)
+// (section 11) — jamais les tokens des autres appareils.
+async function sendPushToUserDevices(uid, title, body, catId, tab) {
+  const ref = fsDb().collection('users').doc(uid).collection('data').doc('mrp-fcm-devices');
+  const snap = await ref.get();
+  const devices = snap.exists ? (snap.data().value || {}) : {};
+  const deviceIds = Object.keys(devices);
+  if (!deviceIds.length) return;
+
+  let devicesChanged = false;
+  await Promise.all(deviceIds.map(async (deviceId) => {
+    const device = devices[deviceId];
+    if (!device || !device.token) return;
+    try {
+      await admin.messaging().send({
+        token: device.token,
+        notification: { title, body },
+        data: { tab: tab || '', catId }
+      });
+    } catch (e) {
+      const code = e && e.errorInfo && e.errorInfo.code;
+      if (code === 'messaging/registration-token-not-registered' || code === 'messaging/invalid-registration-token') {
+        delete devices[deviceId];
+        devicesChanged = true;
+      } else {
+        console.error('[NOTIF] Envoi FCM échoué pour', uid, deviceId, e);
+      }
+    }
+  }));
+  if (devicesChanged) await ref.set({ value: devices });
+}
+
+// Point d'entrée du cycle, exécuté chaque minute (voir setInterval plus bas) —
+// PAS un setTimeout/setInterval frontend (interdit section 4 du complément :
+// un onglet fermé arrête tout JS navigateur) : ceci tourne dans le process
+// Node du backend Render, qui reste actif indépendamment de RoutinePOV. C'est
+// le même principe que cron lui-même (une vérification par minute), simplement
+// implémenté ici plutôt que délégué à Cloud Scheduler (voir choix d'architecture).
+let notificationTickRunning = false;
+async function runScheduledNotificationsTick() {
+  if (!firebaseAdminReady) return; // FIREBASE_SERVICE_ACCOUNT_JSON non configuré
+  if (notificationTickRunning) return; // évite un chevauchement si un cycle précédent traîne
+  notificationTickRunning = true;
+  try {
+    const listResult = await admin.auth().listUsers(1000);
+    await Promise.all(listResult.users.map(async (userRecord) => {
+      const uid = userRecord.uid;
+      try {
+        const dataCol = fsDb().collection('users').doc(uid).collection('data');
+        const [settingsSnap, tzSnap] = await Promise.all([
+          dataCol.doc('mrp-notif-settings').get(),
+          dataCol.doc('mrp-timezone').get()
+        ]);
+        const settings = settingsSnap.exists ? (settingsSnap.data().value || null) : null;
+        if (!settings || !settings.enabled) return; // notifications désactivées pour cet utilisateur
+
+        const timezone = tzSnap.exists ? tzSnap.data().value : null;
+        const { dateIso, hhmm, weekdayFr } = getLocalContext(timezone);
+
+        const dueCategories = NOTIFICATION_SCHEDULE.filter(cat => cat.times.includes(hhmm) && settings[cat.settingsFlag]);
+        if (!dueCategories.length) return;
+
+        const d = await buildServerDashboardData(uid, dateIso, weekdayFr);
+        for (const cat of dueCategories) {
+          if (!cat.isRelevant(d)) continue;
+          const canSend = await claimNotificationOccurrence(uid, cat.id, dateIso, hhmm);
+          if (!canSend) continue;
+          await sendPushToUserDevices(uid, cat.title, cat.build(d), cat.id, cat.tab);
+        }
+      } catch (e) {
+        console.error('[NOTIF] Cycle échoué pour', uid, e);
+      }
+    }));
+  } catch (e) {
+    console.error('[NOTIF] Cycle de notifications programmées échoué', e);
+  } finally {
+    notificationTickRunning = false;
+  }
+}
+
+setInterval(runScheduledNotificationsTick, 60 * 1000);
+
+// ============================================================================
+// ⚠️ LIMITATION RÉELLE — Plan gratuit Render (section 8/23) : Render met ce
+// serveur en veille après une période d'inactivité (voir le commentaire déjà
+// présent dans index.html, window.api). Pendant que le serveur dort, le
+// setInterval ci-dessus ne tourne PAS : aucune notification n'est déclenchée à
+// l'heure programmée tant que personne n'a fait de requête récente. C'est une
+// vraie limitation d'infrastructure, pas un détail — voir le rapport final pour
+// les options (plan payant "always-on", ou déclencheur externe ci-dessous).
+//
+// Route de secours : un service de "cron externe" GRATUIT (cron-job.org,
+// UptimeRobot, GitHub Actions planifiée...) peut appeler cette URL chaque
+// minute pour réveiller le serveur ET déclencher le cycle immédiatement, sans
+// attendre le setInterval. Protégée par un secret partagé lu depuis une
+// variable d'environnement (JAMAIS exposée au frontend) — sans le bon secret,
+// répond 404 (ne révèle même pas que la route existe).
+// ============================================================================
+app.get('/api/notifications/tick', async (req, res) => {
+  if (!process.env.NOTIFICATIONS_TICK_SECRET || req.query.key !== process.env.NOTIFICATIONS_TICK_SECRET) {
+    return res.status(404).end();
+  }
+  await runScheduledNotificationsTick();
+  res.json({ ok: true });
+});
+
+// ============================================================================
+// MODE TEST TEMPORAIRE (section 9 du complément) — À SUPPRIMER une fois la
+// vérification terminée : retire uniquement cette route (et le commentaire),
+// rien d'autre n'en dépend. Envoie un vrai Push FCM à l'UTILISATEUR CONNECTÉ
+// (jamais à un autre uid), immédiatement ou dans quelques minutes, en
+// contournant les conditions métier — sert uniquement à vérifier que la chaîne
+// Firestore → Backend → FCM → Service Worker → téléphone fonctionne de bout en
+// bout, sans attendre un horaire réel.
+// ============================================================================
+app.post('/api/notifications/test', requireFirebaseAuth, async (req, res) => {
+  const delayMinutes = Math.max(0, Math.min(30, Number(req.body?.delayMinutes) || 0));
+  const run = async () => {
+    try {
+      await sendPushToUserDevices(req.uid, '🔔 Test RoutinePOV', 'Cette notification confirme que la chaîne Push fonctionne.', 'test', null);
+    } catch (e) {
+      console.error('[NOTIF][TEST] échec', req.uid, e);
+    }
+  };
+  if (delayMinutes === 0) {
+    await run();
+    return res.json({ success: true, sentAt: 'now' });
+  }
+  setTimeout(run, delayMinutes * 60 * 1000); // usage ponctuel de test, process serveur persistant — voir avertissement ci-dessus
+  res.json({ success: true, scheduledInMinutes: delayMinutes });
+});
+
 app.listen(PORT, () => console.log(`Serveur prêt sur le port ${PORT}`));
