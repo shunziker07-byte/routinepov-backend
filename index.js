@@ -547,7 +547,7 @@ const GARMIN_REDIRECT_URI = process.env.GARMIN_REDIRECT_URI || '';
 const GARMIN_CONFIGURED = Boolean(GARMIN_CLIENT_ID && GARMIN_CLIENT_SECRET && GARMIN_REDIRECT_URI);
 // URL de l'app frontend vers laquelle rediriger l'utilisateur une fois le
 // callback OAuth traité (retour sur l'onglet Réglages).
-const FRONTEND_URL = process.env.CLIENT_URL_FOR_REDIRECT || 'https://myroutinepov.web.app';
+const FRONTEND_URL = process.env.CLIENT_URL_FOR_REDIRECT || 'https://my-routinepov.web.app';
 
 // Endpoints officiels du Developer Portal Garmin (OAuth2 + PKCE). À reconfirmer
 // dans la documentation une fois l'accès au Developer Portal obtenu : Garmin a
