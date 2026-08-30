@@ -907,6 +907,28 @@ app.get('/api/subscription/limits', requireFirebaseAuth, async (req, res) => {
 });
 
 // ============================================================================
+// PROMPT 23 — GET /api/widget-data : couche de données pour les futurs
+// widgets (iOS/Android natifs). Suit la convention déjà en place dans ce
+// fichier (routes /api/... sans préfixe de version dans l'URL) plutôt que
+// d'introduire /api/v1/... isolément — le champ "v": 1 dans la réponse
+// JSON permet déjà de faire évoluer le format plus tard sans casser un
+// widget déjà installé (il peut vérifier ce champ avant de parser).
+// Authentification IDENTIQUE à toutes les autres routes : requireFirebaseAuth
+// vérifie le token Firebase et fournit req.uid — un widget ne peut donc
+// jamais demander les données d'un autre utilisateur en changeant un
+// paramètre, exactement comme le reste de l'API (voir §17 du prompt).
+// ============================================================================
+app.get('/api/widget-data', requireFirebaseAuth, async (req, res) => {
+  try {
+    const data = await buildWidgetData(req.uid);
+    res.json(data);
+  } catch (e) {
+    console.error('[WIDGET-DATA] route error', e);
+    res.status(500).json({ error: "Impossible de récupérer les données pour le moment." });
+  }
+});
+
+// ============================================================================
 // Administration — offrir/retirer Premium à un utilisateur.
 // ----------------------------------------------------------------------------
 // Toutes les routes /api/admin/* sont protégées par requireFirebaseAuth PUIS
@@ -1894,6 +1916,422 @@ async function buildServerDashboardData(uid, dateIso, weekdayFr) {
     meals: { loggedTypes: loggedMealTypes, total: DASHBOARD_MEAL_SLOTS.length, nextSlot: nextMealSlot },
     steps: { today: todaySteps, goal: stepsData.goal || 0 }
   };
+}
+
+// ============================================================================
+// PROMPT 23 — Couche de données pour les futurs widgets (iOS/Android natifs).
+// ----------------------------------------------------------------------------
+// buildWidgetData() ne RECALCULE JAMAIS une donnée qui existe déjà ailleurs :
+// elle appelle buildServerDashboardData() (la même fonction déjà utilisée par
+// le moteur de notifications, voir runScheduledNotificationsTick ci-dessous)
+// et se contente d'AJOUTER les quelques champs qui manquent pour un widget
+// (score du jour, macros repas, prochain voyage) — jamais une deuxième
+// source de vérité. computeDailyScoreServer() ci-dessous est un PORT
+// EXACT, ligne à ligne, de computeDailyScore() côté frontend
+// (js/01-core-home-goals-todos.js) : même formule, mêmes données en entrée
+// (todos.done est dérivé de total - pending.length, exactement comme le fait
+// déjà DashboardDataService() côté frontend) → même résultat que
+// l'application, jamais un score différent.
+//
+// Volontairement HORS PÉRIMÈTRE de cette première version (voir rapport) :
+// le "prochain événement" du calendrier (Life Planner). Le calculer
+// correctement nécessite de porter ici le moteur de récurrence du calendrier
+// (séries, exceptions, décalages) déjà présent côté frontend
+// (js/08-calendar.js) — une vraie duplication de logique, pas un simple ajout
+// de champ. Conformément à la consigne ("ne recrée pas un deuxième calcul
+// différent"), je ne l'ai pas approximé : mieux vaut l'omettre que risquer un
+// résultat différent de l'application. À faire dans une étape dédiée si vous
+// le souhaitez.
+// ============================================================================
+// PROMPT 26 — Port du moteur de récurrence du calendrier (js/08-calendar.js)
+// pour permettre à planner.nextEvent d'exister enfin dans /api/widget-data.
+// ----------------------------------------------------------------------------
+// Ce qui suit, jusqu'à getNextEventServer(), est un PORT LIGNE À LIGNE des
+// fonctions calParseISO / calAddDays / calDiffDays / calAddMonths /
+// calMondayOf / calWeekdayMonday0 / calStepsToReach / calExpandRecurrenceDates
+// / calRecurrenceSpanDays / calOccurrenceEndDate de js/08-calendar.js — MÊMES
+// NOMS, MÊME CORPS, volontairement, pour que toute correction future du moteur
+// de récurrence côté frontend puisse être reportée ici par simple copier-coller
+// plutôt que réécrite. Ne PAS diverger de ces fonctions sans reporter le même
+// changement des deux côtés (même avertissement que pour
+// computeDailyScoreServer, voir plus bas dans ce fichier).
+// ============================================================================
+function calParseISO(iso){
+  const [y,m,d] = iso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+}
+function calFormatISO(date){
+  return date.toISOString().slice(0,10);
+}
+function calAddDays(iso, n){
+  const d = calParseISO(iso);
+  d.setUTCDate(d.getUTCDate() + n);
+  return calFormatISO(d);
+}
+function calDiffDays(aIso, bIso){
+  return Math.round((calParseISO(bIso) - calParseISO(aIso)) / 86400000);
+}
+function calAddMonths(iso, n){
+  const d = calParseISO(iso);
+  const day = d.getUTCDate();
+  const target = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + n, 1));
+  const lastDayOfTargetMonth = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  target.setUTCDate(Math.min(day, lastDayOfTargetMonth));
+  return calFormatISO(target);
+}
+function calWeekdayMonday0(iso){
+  const jsDay = calParseISO(iso).getUTCDay();
+  return (jsDay + 6) % 7;
+}
+function calMondayOf(iso){
+  return calAddDays(iso, -calWeekdayMonday0(iso));
+}
+function calRecurrenceSpanDays(ev){
+  return calDiffDays(ev.date, ev.endDate || ev.date);
+}
+function calOccurrenceEndDate(startIso, spanDays){
+  return spanDays > 0 ? calAddDays(startIso, spanDays) : startIso;
+}
+function calStepsToReach(freq, interval, fromIso, targetIso){
+  if(targetIso <= fromIso) return 0;
+  if(freq === 'daily'){
+    return Math.floor(calDiffDays(fromIso, targetIso) / interval);
+  }
+  if(freq === 'weekly'){
+    return Math.floor(calDiffDays(fromIso, targetIso) / (7 * interval));
+  }
+  if(freq === 'monthly' || freq === 'yearly'){
+    const fD = calParseISO(fromIso), tD = calParseISO(targetIso);
+    const monthsDiff = (tD.getUTCFullYear() - fD.getUTCFullYear()) * 12 + (tD.getUTCMonth() - fD.getUTCMonth());
+    const unitMonths = freq === 'monthly' ? interval : interval * 12;
+    return Math.max(0, Math.floor(monthsDiff / unitMonths) - 1);
+  }
+  return 0;
+}
+function calExpandRecurrenceDates(ev, rangeStart, rangeEnd){
+  if(!ev.recurrence || !ev.recurrence.freq || ev.recurrence.freq === 'none'){
+    const end = ev.endDate || ev.date;
+    return (ev.date <= rangeEnd && end >= rangeStart) ? [ev.date] : [];
+  }
+  const { freq, interval = 1, byWeekday, until } = ev.recurrence;
+  const exceptions = new Set(ev.recurrenceExceptions || []);
+  const hardEnd = until && until < rangeEnd ? until : rangeEnd;
+  const out = [];
+
+  if(freq === 'weekly' && Array.isArray(byWeekday) && byWeekday.length){
+    let blockMonday = calMondayOf(ev.date);
+    const jump = calStepsToReach('weekly', interval, blockMonday, calMondayOf(rangeStart));
+    if(jump > 0) blockMonday = calAddDays(blockMonday, 7 * interval * jump);
+    let iterations = 0;
+    while(blockMonday <= hardEnd && iterations < 730){
+      for(const wd of byWeekday){
+        const occ = calAddDays(blockMonday, wd);
+        iterations++;
+        if(occ < ev.date) continue;
+        if(until && occ > until) continue;
+        if(occ < rangeStart || occ > rangeEnd) continue;
+        if(exceptions.has(occ)) continue;
+        out.push(occ);
+      }
+      blockMonday = calAddDays(blockMonday, 7 * interval);
+    }
+    return out.sort();
+  }
+
+  const jump = calStepsToReach(freq, interval, ev.date, rangeStart);
+  let cursor = ev.date;
+  if(jump > 0){
+    if(freq === 'daily') cursor = calAddDays(cursor, interval * jump);
+    else if(freq === 'weekly') cursor = calAddDays(cursor, 7 * interval * jump);
+    else if(freq === 'monthly') cursor = calAddMonths(cursor, interval * jump);
+    else if(freq === 'yearly') cursor = calAddMonths(cursor, 12 * interval * jump);
+  }
+
+  let iterations = 0;
+  while(cursor <= hardEnd && iterations < 730){
+    iterations++;
+    if(until && cursor > until) break;
+    if(cursor > rangeEnd) break;
+    if(cursor >= rangeStart && !exceptions.has(cursor)) out.push(cursor);
+    if(freq === 'daily') cursor = calAddDays(cursor, interval);
+    else if(freq === 'weekly') cursor = calAddDays(cursor, 7 * interval);
+    else if(freq === 'monthly') cursor = calAddMonths(cursor, interval);
+    else if(freq === 'yearly') cursor = calAddMonths(cursor, 12 * interval);
+    else break;
+  }
+  return out;
+}
+
+// getNextEventServer() N'EST PAS un port direct d'une fonction frontend — le
+// frontend n'a jamais eu besoin de "la toute prochaine occurrence, tous types
+// confondus" (Calendar affiche un jour/une semaine/un mois entier, jamais une
+// seule prochaine occurrence isolée). Cette fonction est donc nouvelle, mais
+// elle n'introduit AUCUN nouveau calcul de date d'occurrence : elle réutilise
+// exclusivement calExpandRecurrenceDates()/calRecurrenceSpanDays() ci-dessus
+// (les fonctions, elles, sont bien portées à l'identique) pour générer les
+// mêmes dates que Calendar afficherait, puis choisit la plus proche dans le
+// futur. Inclut les Events autonomes (récurrents ou non) ET les Tasks avec
+// horaire (startTime+endTime) — exactement le même périmètre que
+// calGetDayOccurrences() côté frontend (voir le commentaire au-dessus de
+// cette fonction dans js/08-calendar.js).
+function getNextEventServer(calendarEvents, todos, dateIso, hhmm){
+  const HORIZON_DAYS = 60; // au-delà, aucun widget n'a besoin d'annoncer un événement si lointain
+  const rangeEnd = calAddDays(dateIso, HORIZON_DAYS);
+  const candidates = [];
+
+  (calendarEvents || []).forEach(ev => {
+    if(!ev || !ev.date) return;
+    const span = calRecurrenceSpanDays(ev);
+    calExpandRecurrenceDates(ev, dateIso, rangeEnd).forEach(occDate => {
+      candidates.push({
+        date: occDate, endDate: calOccurrenceEndDate(occDate, span),
+        title: ev.title, startTime: ev.startTime || '', allDay: !!ev.allDay
+      });
+    });
+  });
+
+  (todos || []).forEach(t => {
+    if(t && t.dueDate && t.dueDate >= dateIso && t.dueDate <= rangeEnd && t.startTime && t.endTime){
+      candidates.push({ date: t.dueDate, endDate: t.dueDate, title: t.text, startTime: t.startTime, allDay: false });
+    }
+  });
+
+  // Ne garde que ce qui n'a pas encore commencé : tout jour strictement futur,
+  // ou aujourd'hui si "toute la journée" ou si l'heure de début n'est pas
+  // encore passée (comparaison directe de chaînes "HH:MM", valide car format
+  // fixe zero-paddé, déjà utilisé ailleurs dans le projet de la même façon).
+  const upcoming = candidates.filter(c => {
+    if(c.date > dateIso) return true;
+    if(c.date < dateIso) return false;
+    if(c.allDay) return true;
+    return !c.startTime || c.startTime >= hhmm;
+  });
+
+  upcoming.sort((a, b) => {
+    if(a.date !== b.date) return a.date < b.date ? -1 : 1;
+    const at = a.allDay ? '' : (a.startTime || '');
+    const bt = b.allDay ? '' : (b.startTime || '');
+    return at.localeCompare(bt);
+  });
+
+  const next = upcoming[0];
+  if(!next) return null;
+  return {
+    title: next.title, start: next.date, startTime: next.allDay ? null : (next.startTime || null), allDay: next.allDay
+  };
+}
+
+async function buildWidgetData(uid) {
+  const dataCol = fsDb().collection('users').doc(uid).collection('data');
+
+  // Fuseau horaire de l'utilisateur — mêmes clé et repli que les notifications
+  // (mrp-timezone / FALLBACK_TIMEZONE via getLocalContext), pas une nouvelle logique.
+  let timezone = null;
+  try {
+    const tzSnap = await dataCol.doc('mrp-timezone').get();
+    timezone = tzSnap.exists ? tzSnap.data().value : null;
+  } catch (e) {
+    console.error('[WIDGET-DATA] lecture du fuseau horaire échouée pour', uid, e);
+  }
+  const { dateIso, hhmm, weekdayFr } = getLocalContext(timezone);
+
+  // PROMPT 24 : chaque section est récupérée indépendamment et protégée par son
+  // propre try/catch (§18-19 du prompt — "une erreur de récupération d'une
+  // donnée ne doit pas casser tout le système"). Si une section échoue, elle
+  // est simplement absente de la réponse (valeur null / non incluse) et son nom
+  // apparaît dans `errors` — le reste de la réponse reste utilisable. Aucune
+  // des 4 lectures ci-dessous ne dépend d'une autre : une erreur Garmin, par
+  // exemple, ne peut jamais empêcher tasks/workout/goal/meals/score de revenir.
+  const errors = [];
+
+  // 1) Source principale — RÉUTILISE buildServerDashboardData() telle quelle
+  //    (déjà utilisée par les notifications, voir runScheduledNotificationsTick
+  //    plus haut) : gym, todos (Today's List uniquement), objectif actif,
+  //    statut des repas loggés, pas. Aucune deuxième lecture, aucun deuxième
+  //    calcul pour ces domaines.
+  let d = null;
+  try {
+    d = await buildServerDashboardData(uid, dateIso, weekdayFr);
+  } catch (e) {
+    console.error('[WIDGET-DATA] buildServerDashboardData a échoué pour', uid, e);
+    errors.push('core');
+  }
+
+  // 2) Macros du jour — même calcul que renderMeals() côté frontend
+  //    (js/05-meals-weight-steps-settings.js) : somme des entrées du jour,
+  //    objectifs Meals Tracker (mêmes valeurs par défaut MEALS_DEFAULT_GOALS
+  //    que le frontend si l'utilisateur n'a jamais ouvert Settings — avant ce
+  //    correctif, un repli différent [{}] pouvait afficher un objectif "0" au
+  //    lieu de la vraie valeur par défaut de l'app).
+  let mealTotals = null, mealGoals = null;
+  try {
+    const mealsSnap = await dataCol.doc('mrp-meals').get();
+    const mealsData = mealsSnap.exists ? (mealsSnap.data().value || {}) : {};
+    const todayMealEntries = (mealsData.entries || []).filter(e => e && e.date === dateIso);
+    mealTotals = todayMealEntries.reduce((acc, e) => {
+      acc.calories += e.calories || 0; acc.protein += e.protein || 0;
+      acc.carbs += e.carbs || 0; acc.fat += e.fat || 0;
+      return acc;
+    }, { calories: 0, protein: 0, carbs: 0, fat: 0 });
+    mealGoals = { ...MEALS_DEFAULT_GOALS, ...(mealsData.goals || {}) };
+  } catch (e) {
+    console.error('[WIDGET-DATA] lecture des repas échouée pour', uid, e);
+    errors.push('meals');
+  }
+
+  // 3) Prochain voyage — logique simple (pas de récurrence, contrairement au
+  //    calendrier) : premier voyage dont la date de fin n'est pas déjà passée,
+  //    trié par date de début. Même donnée brute que l'onglet Voyage
+  //    (mrp-voyages-advanced), juste triée/filtrée — aucun risque de diverger.
+  let nextTrip = null;
+  try {
+    const tripsSnap = await dataCol.doc('mrp-voyages-advanced').get();
+    const tripsState = tripsSnap.exists ? (tripsSnap.data().value || { trips: [] }) : { trips: [] };
+    const upcomingTrips = (tripsState.trips || [])
+      .filter(t => t && (t.endDate || t.startDate) && (t.endDate || t.startDate) >= dateIso)
+      .sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
+    nextTrip = upcomingTrips[0] || null;
+  } catch (e) {
+    console.error('[WIDGET-DATA] lecture des voyages échouée pour', uid, e);
+    errors.push('travel');
+  }
+
+  // 4) Statut Garmin — RÉUTILISE la même collection que GET /api/garmin/status
+  //    (jamais le token, uniquement connected/lastSync, déjà jugé non sensible
+  //    lors de l'audit sécurité). RoutinePOV ne synchronise réellement QUE les
+  //    pas depuis Garmin (voir webhook /api/garmin/webhook, values.steps) — pas
+  //    de calories ni de fréquence cardiaque dans le modèle de données actuel,
+  //    donc pas de champ inventé pour ces valeurs (§12 : "ne crée aucune donnée
+  //    simulée"). Les pas eux-mêmes restent dans `activity.steps` (déjà fournis
+  //    par buildServerDashboardData, qu'ils viennent d'une saisie manuelle ou
+  //    d'un sync Garmin — la donnée brute mrp-steps ne fait pas la différence
+  //    au niveau du total du jour).
+  let garmin = { connected: false, lastSync: null };
+  try {
+    const garminSnap = await fsDb().collection('garminConnections').doc(uid).get();
+    garmin = garminSnap.exists
+      ? { connected: true, lastSync: garminSnap.data().lastSyncAt || null }
+      : { connected: false, lastSync: null };
+  } catch (e) {
+    console.error('[WIDGET-DATA] lecture du statut Garmin échouée pour', uid, e);
+    errors.push('garmin');
+  }
+
+  // 5) Prochain événement (Life Planner) — PROMPT 26. Lecture indépendante de
+  //    mrp-calendar-events + mrp-todos (todos complet, PAS le sous-ensemble
+  //    Today's List déjà renvoyé par buildServerDashboardData — le calendrier
+  //    doit voir aussi les tâches Long Term List avec horaire, exactement
+  //    comme calGetDayOccurrences() côté frontend). Isolée comme les 4 autres
+  //    sections : une panne ici n'affecte jamais tasks/workout/goal/meals/score.
+  let nextEvent = null;
+  try {
+    const [calSnap, todosSnap] = await Promise.all([
+      dataCol.doc('mrp-calendar-events').get(),
+      dataCol.doc('mrp-todos').get()
+    ]);
+    const calendarEventsList = calSnap.exists ? (calSnap.data().value || []) : [];
+    const todosList = todosSnap.exists ? (todosSnap.data().value || []) : [];
+    nextEvent = getNextEventServer(calendarEventsList, todosList, dateIso, hhmm);
+  } catch (e) {
+    console.error('[WIDGET-DATA] calcul du prochain événement échoué pour', uid, e);
+    errors.push('planner');
+  }
+
+  // Score du jour — port exact de computeDailyScore() (js/01-core-home-goals-todos.js),
+  // voir computeDailyScoreServer ci-dessous. Uniquement si la source principale (d)
+  // a pu être lue — sinon impossible à calculer, reste `null` (jamais un faux 0).
+  let dailyScore = null;
+  let todosDone = 0;
+  if (d) {
+    todosDone = d.todos.total - d.todos.pending.length;
+    dailyScore = computeDailyScoreServer({
+      gym: d.gym, todos: { ...d.todos, done: todosDone },
+      goals: d.goals, meals: d.meals, steps: d.steps
+    });
+  }
+
+  // Données MINIMALES uniquement (§7/§16/§24 du prompt) : jamais le profil
+  // complet, jamais l'historique complet, jamais de token/secret/donnée Garmin
+  // au-delà de connected/lastSync. Convention de nommage stable et groupée par
+  // domaine (§13/§25/§26) — structure destinée à ne plus changer de noms de
+  // champs une fois consommée par un vrai widget (seul `version` évoluera).
+  //
+  // IMPORTANT — null vs 0 (§16) : `null` signifie explicitement "aucune donnée
+  // / non calculable" (ex. score si la source principale a échoué, `workout`/
+  // `goal`/`travel.nextTrip` si rien n'est programmé). Un `0` numérique
+  // (tasks.total, meals.calories, activity.steps.today...) est TOUJOURS une
+  // vraie valeur observée (ex. "aucun repas loggé aujourd'hui" = 0 réel), au
+  // même titre que l'application elle-même ne distingue pas ces cas pour ces
+  // champs précis — donc le widget ne les invente pas non plus.
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    errors, // vide si tout a pu être lu ; sinon liste des sections indisponibles ce cycle-ci
+
+    dailyScore, // number 0-100, identique à Home ; null seulement si `d` n'a pas pu être lu
+
+    tasks: d ? {
+      total: d.todos.total,
+      completed: todosDone,
+      remaining: d.todos.pending.length,
+      // Sous-ensemble réel de Today's List (jamais Long Term List, même filtre
+      // que DEFAULT_TODO_LIST_ID) — pas une nouvelle notion inventée : ce sont
+      // les tâches en attente déjà marquées priorité "Haute" par l'utilisateur.
+      priorityTasks: d.todos.pending.filter(t => t.priority === 'Haute').map(t => ({ title: t.text }))
+    } : null,
+
+    workout: d ? {
+      // null si aucune séance n'est programmée aujourd'hui — jamais une séance
+      // inventée (§7). `done`/`total` ne sont inclus qu'avec une vraie séance.
+      next: d.gym.sessions[0] ? { title: d.gym.sessions[0].name, done: d.gym.done, total: d.gym.total } : null
+    } : null,
+
+    goal: d ? {
+      current: d.goals.focus ? { id: d.goals.focus.id, title: d.goals.focus.title, progress: d.goals.focus.progress || 0 } : null
+    } : null,
+
+    meals: mealTotals ? {
+      calories: Math.round(mealTotals.calories), caloriesGoal: mealGoals.calories,
+      protein: Math.round(mealTotals.protein), proteinGoal: mealGoals.protein,
+      carbs: Math.round(mealTotals.carbs), carbsGoal: mealGoals.carbs,
+      fat: Math.round(mealTotals.fat), fatGoal: mealGoals.fat
+    } : null,
+
+    // Life Planner ("prochain événement") — PROMPT 26 : implémenté via
+    // getNextEventServer() ci-dessus (port du moteur de récurrence). null si
+    // aucun événement/tâche avec horaire dans les 60 prochains jours, ou si la
+    // lecture a échoué (voir errors).
+    planner: { nextEvent },
+
+    travel: {
+      nextTrip: nextTrip ? {
+        title: nextTrip.name || null, destination: nextTrip.destination || null,
+        start: nextTrip.startDate || null, end: nextTrip.endDate || null
+      } : null
+    },
+
+    activity: {
+      steps: d ? { today: d.steps.today, goal: d.steps.goal || null } : null,
+      garmin
+    }
+  };
+}
+
+// Port exact de computeDailyScore() — js/01-core-home-goals-todos.js. Si la
+// formule change un jour côté frontend, reporter EXACTEMENT le même
+// changement ici (voir avertissement en tête de buildWidgetData ci-dessus).
+// Comportement intentionnel hérité du frontend : renvoie 0 (pas null) quand
+// aucune catégorie n'a de donnée du tout — c'est déjà ainsi que l'app se
+// comporte, le widget doit rester identique plutôt que de "corriger" ce choix.
+function computeDailyScoreServer(d) {
+  const parts = [];
+  if (d.gym.total > 0) parts.push(d.gym.done / d.gym.total);
+  if (d.todos.total > 0) parts.push(d.todos.done / d.todos.total);
+  if (d.goals.focus) parts.push((d.goals.focus.progress || 0) / 100);
+  parts.push(d.meals.loggedTypes.size / d.meals.total);
+  if (d.steps.goal > 0) parts.push(Math.min(1, d.steps.today / d.steps.goal));
+  if (!parts.length) return 0;
+  return Math.round((parts.reduce((s, v) => s + v, 0) / parts.length) * 100);
 }
 
 // Idempotence (section 7 du complément) : un document est CRÉÉ (jamais mis à
